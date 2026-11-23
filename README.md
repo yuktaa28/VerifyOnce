@@ -32,7 +32,7 @@ Then edit `.env` and fill in your own values. `.env` is git-ignored: never commi
 |---|---|---|
 | `EXTRACTION_PROVIDER` | `gemini` | `gemini` (free tier) or `anthropic` (paid) |
 | `GEMINI_API_KEY` | (none) | Needed for live extraction with Gemini. A free key comes from Google AI Studio. Without it, every upload is flagged for review. |
-| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model used to read documents. Set it to any vision model your key can use. |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model used to read documents. `python scripts/list_models.py` lists the ones your key can use. |
 | `ANTHROPIC_API_KEY` | (none) | Only needed when `EXTRACTION_PROVIDER=anthropic` |
 | `ANTHROPIC_MODEL` | `claude-opus-5-5` | Model used when the provider is `anthropic` |
 | `EXTRACTION_USE_CACHE` | off | `1` reads cached results from `data/cache/` first; live is the default |
@@ -49,6 +49,7 @@ uvicorn backend.main:app --reload           # API on http://127.0.0.1:8000, docs
 python -m pytest                            # all offline tests (the model is mocked)
 python scripts/run_seed_cases.py            # every seed profile x every scheme, expected vs actual
 python scripts/make_documents.py            # regenerate the synthetic documents
+python scripts/list_models.py               # Gemini models your key can use that accept images (names only)
 python scripts/live_check.py --injection    # real extraction of the clean, blurry and injection marksheets
 python -m pytest -m live --run-live -s      # opt-in tests against the real provider (3 API calls)
 ```
@@ -80,7 +81,8 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
    - The system prompt says document text is untrusted data, that instructions inside a document are ignored, and that the reply is only JSON.
    - The provider constrains the reply to the JSON schema, and Pydantic re-checks it with extra keys forbidden.
    - An invalid reply gets one retry. A second failure stores every field empty, so the document goes to an officer.
-   - **Failures go straight to officer review:** a refusal, a blocked response (Gemini safety blocks included), an API or network error, or a quota / rate limit (HTTP 429). There is no fallback model and no crash. The upload returns `extraction_failed`, every field is flagged, and the reason is logged and returned in `extraction.error`.
+   - **Transient errors are retried:** HTTP 429 (quota / rate limit), 408, 5xx such as `503 UNAVAILABLE`, network timeouts and connection errors get up to 3 attempts, waiting about 2s and then 5s. Each retry is logged.
+   - **Everything else goes straight to officer review:** a refusal, a blocked response (Gemini safety blocks included), an authentication or other client error (for example an invalid key or unknown model), or a transient error that outlasts the retries. There is no fallback model and no crash. The upload returns `extraction_failed`, every field is flagged, and the reason is logged and returned in `extraction.error`.
    - Results are cached by file hash in `data/cache/`, written only by real live runs. Each result says `live` or `cache`, and which provider and model produced it.
    - The model never sees scheme rules and never decides anything.
 2. **Verification** (`backend/verification.py`). Each fact moves from `unverified` to `verified` or `flagged`. It is flagged when:

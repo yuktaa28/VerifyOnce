@@ -3,8 +3,11 @@
 __pycache__/
 .pytest_cache/
 
-# Secrets
+# Secrets: .env and any copy of it (.env.txt, .env.local, ...), but keep the template
 .env
+.env.*
+*.env
+!.env.example
 
 # Databases
 *.db

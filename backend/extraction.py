@@ -9,8 +9,11 @@ tier through the google-genai SDK) or ``anthropic``. Everything else is shared:
   the same JSON schema, and Pydantic checks it again here with extra keys forbidden.
 * An invalid reply gets one fresh retry. If that also fails, the extraction fails and
   every field of the document is stored empty, which routes it to an officer.
-* A refusal or blocked response, an API error, or a quota / rate limit (HTTP 429)
-  fails the extraction at once, without a crash and without a fallback model. The
+* Transient errors (HTTP 429 quota / rate limit, 408, 5xx such as 503 UNAVAILABLE,
+  network timeouts and connection errors) are retried: up to 3 attempts, waiting 2s
+  and then 5s, with each retry logged. A refusal or blocked response, an
+  authentication or other client error, or a transient error that outlasts the
+  retries fails the extraction without a crash and without a fallback model. The
   failure is logged and the document goes to an officer.
 * The model only reads fields. It never sees scheme rules and never decides a verdict.
 * Results are cached by file hash in ``data/cache/``. Live extraction is the default.
@@ -29,6 +32,8 @@ import io
 import json
 import logging
 import re
+import time
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -57,6 +62,8 @@ MAX_TOKENS = 16000  # Anthropic only; Gemini uses the model's default output lim
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_SIDE = 8000
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif", "WEBP": "image/webp"}
+RETRY_DELAYS = (2.0, 5.0)  # seconds to wait before attempt 2 and attempt 3
+TRANSIENT_HTTP_CODES = {408, 429, 500, 502, 503, 504, 529}
 
 
 # --- Schemas ------------------------------------------------------------------------------
@@ -186,11 +193,16 @@ class ModelReply:
 
 
 class ProviderError(Exception):
-    """The call failed (API error, network, quota). ``quota`` marks HTTP 429 / exhausted quota."""
+    """The call failed (API error, network, quota).
 
-    def __init__(self, message: str, *, quota: bool = False) -> None:
+    ``transient`` errors are worth retrying (429, 408, 5xx, timeouts, connection
+    errors). ``quota`` marks HTTP 429 / exhausted quota.
+    """
+
+    def __init__(self, message: str, *, quota: bool = False, transient: bool = False) -> None:
         super().__init__(message)
         self.quota = quota
+        self.transient = transient
 
 
 class Provider(Protocol):
@@ -246,12 +258,15 @@ class GeminiProvider:
             if exc.code == 429 or exc.status == "RESOURCE_EXHAUSTED":
                 raise ProviderError(
                     f"Gemini quota or rate limit reached (HTTP 429 {exc.status or 'RESOURCE_EXHAUSTED'}). "
-                    "Wait and retry, or check the quota for this API key.",
-                    quota=True,
+                    "Wait and retry, or check the quota for this API key",
+                    quota=True, transient=True,
                 ) from None
-            raise ProviderError(f"Gemini API error {exc.code} {exc.status}: {exc.message}") from None
+            raise ProviderError(f"Gemini API error {exc.code} {exc.status}: {exc.message}",
+                                transient=exc.code in TRANSIENT_HTTP_CODES) from None
+        except httpx2.TimeoutException:
+            raise ProviderError("The Gemini API timed out", transient=True) from None
         except (httpx2.TransportError, OSError):
-            raise ProviderError("Could not reach the Gemini API") from None
+            raise ProviderError("Could not reach the Gemini API", transient=True) from None
 
         model = getattr(response, "model_version", None) or self.model
         feedback = getattr(response, "prompt_feedback", None)
@@ -288,7 +303,8 @@ class AnthropicProvider:
 
     def _get_client(self) -> Any:
         if self._client is None:
-            self._client = anthropic.Anthropic(api_key=self._api_key)
+            # The Extractor owns retries, so the SDK's own retries are turned off.
+            self._client = anthropic.Anthropic(api_key=self._api_key, max_retries=0)
         return self._client
 
     def generate(self, request: ModelRequest) -> ModelReply:
@@ -308,12 +324,15 @@ class AnthropicProvider:
         except anthropic.APIStatusError as exc:
             if exc.status_code == 429:
                 raise ProviderError(
-                    "Anthropic rate limit or quota reached (HTTP 429). Wait and retry, or check your plan.",
-                    quota=True,
+                    "Anthropic rate limit or quota reached (HTTP 429). Wait and retry, or check your plan",
+                    quota=True, transient=True,
                 ) from None
-            raise ProviderError(f"Anthropic API error {exc.status_code}: {exc.message}") from None
+            raise ProviderError(f"Anthropic API error {exc.status_code}: {exc.message}",
+                                transient=exc.status_code in TRANSIENT_HTTP_CODES) from None
+        except anthropic.APITimeoutError:
+            raise ProviderError("The Anthropic API timed out", transient=True) from None
         except anthropic.APIConnectionError:
-            raise ProviderError("Could not reach the Anthropic API") from None
+            raise ProviderError("Could not reach the Anthropic API", transient=True) from None
         except anthropic.APIError as exc:
             raise ProviderError(f"Anthropic API error: {type(exc).__name__}") from None
 
@@ -348,7 +367,7 @@ class ExtractionResult:
     model: str | None
     readings: dict[str, dict[str, Any]] = field(default_factory=dict)  # field -> {value, confidence}
     raw_responses: list[str] = field(default_factory=list)
-    attempts: int = 0
+    attempts: int = 0  # model calls made, including retries
     error: str | None = None
 
     @property
@@ -419,10 +438,20 @@ def image_media_type(content: bytes) -> str:
 
 
 class Extractor:
-    def __init__(self, provider: Provider, *, use_cache: bool = False, cache_dir: Path = DEFAULT_CACHE_DIR) -> None:
+    def __init__(
+        self,
+        provider: Provider,
+        *,
+        use_cache: bool = False,
+        cache_dir: Path = DEFAULT_CACHE_DIR,
+        retry_delays: tuple[float, ...] = RETRY_DELAYS,
+        sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
         self.provider = provider
         self.use_cache = use_cache
         self.cache_dir = Path(cache_dir)
+        self.retry_delays = tuple(retry_delays)
+        self._sleep = sleep
 
     @property
     def model(self) -> str:
@@ -450,8 +479,28 @@ class Extractor:
             self._write_cache(result)
         else:
             log.warning("Extraction failed for %s %s (%s): %s. Sent to officer review.",
-                        document_type, sha256[:12], self.provider.name, result.error)
+                        document_type, sha256[:12], self.provider.name, (result.error or "").rstrip("."))
         return result
+
+    def _generate_with_retries(self, request: ModelRequest, label: str) -> tuple[ModelReply | None, int, ProviderError | None]:
+        """Call the provider, retrying transient errors. Returns (reply, calls made, final error)."""
+        max_attempts = len(self.retry_delays) + 1
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return self.provider.generate(request), attempt, None
+            except ProviderError as exc:
+                if not exc.transient:
+                    return None, attempt, exc
+                if attempt == max_attempts:
+                    return None, attempt, ProviderError(
+                        f"{str(exc).rstrip('.')}. Gave up after {max_attempts} attempts.",
+                        quota=exc.quota, transient=True,
+                    )
+                delay = self.retry_delays[attempt - 1]
+                log.warning("%s call for %s failed: %s. Retrying in %.0fs (attempt %d of %d).",
+                            self.provider.name, label, str(exc).rstrip("."), delay, attempt + 1, max_attempts)
+                self._sleep(delay)
+        raise AssertionError("unreachable")  # pragma: no cover
 
     # -- live ------------------------------------------------------------------------------
 
@@ -470,21 +519,23 @@ class Extractor:
             return self._result(document_type, sha256, "failed", error=missing)
 
         instruction = f"Extract the fields from this {document_label(document_type)}."
+        label = f"{document_type} {sha256[:12]}"
         raw_responses: list[str] = []
         served_model = self.provider.model
         last_error = ""
-        for attempt in (1, 2):
+        calls = 0
+        for schema_attempt in (1, 2):  # one retry for a reply that breaks the schema
             texts = [instruction]
-            if attempt == 2:
+            if schema_attempt == 2:
                 texts.append(f"A previous attempt did not return valid JSON for the schema ({last_error}). "
                              "Reply with only the JSON object.")
             request = ModelRequest(system_prompt(document_type), content, media_type, tuple(texts),
                                    response_schema(document_type))
-            try:
-                reply = self.provider.generate(request)
-            except ProviderError as exc:
-                return self._result(document_type, sha256, "failed", error=str(exc),
-                                    raw_responses=raw_responses, attempts=attempt)
+            reply, made, error = self._generate_with_retries(request, label)
+            calls += made
+            if error is not None:
+                return self._result(document_type, sha256, "failed", error=str(error),
+                                    raw_responses=raw_responses, attempts=calls)
 
             served_model = reply.model
             text = _scrub_long_numbers(reply.text)
@@ -492,7 +543,7 @@ class Extractor:
                 raw_responses.append(text)
             if reply.blocked:
                 return self._result(document_type, sha256, "failed", model=served_model, error=reply.blocked,
-                                    raw_responses=raw_responses, attempts=attempt)
+                                    raw_responses=raw_responses, attempts=calls)
             try:
                 parsed = _parse_reply(document_type, text)
             except ValidationError as exc:
@@ -500,11 +551,11 @@ class Extractor:
                 continue
             readings = {name: reading.model_dump() for name, reading in parsed}
             return self._result(document_type, sha256, "ok", model=served_model, readings=readings,
-                                raw_responses=raw_responses, attempts=attempt)
+                                raw_responses=raw_responses, attempts=calls)
 
         return self._result(document_type, sha256, "failed", model=served_model,
                             error=f"Reply did not match the schema after one retry: {last_error}",
-                            raw_responses=raw_responses, attempts=2)
+                            raw_responses=raw_responses, attempts=calls)
 
     # -- cache -----------------------------------------------------------------------------
 

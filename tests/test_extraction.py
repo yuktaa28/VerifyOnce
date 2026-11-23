@@ -28,9 +28,26 @@ QUOTA_ERROR = {"error": {"code": 429, "message": "Resource has been exhausted (e
                          "status": "RESOURCE_EXHAUSTED"}}
 
 
+def gemini_error(code: int, status: str, message: str) -> genai_errors.APIError:
+    cls = genai_errors.ServerError if code >= 500 else genai_errors.ClientError
+    return cls(code, {"error": {"code": code, "message": message, "status": status}})
+
+
+def quota() -> genai_errors.APIError:
+    return genai_errors.ClientError(429, QUOTA_ERROR)
+
+
+def unavailable() -> genai_errors.APIError:
+    return gemini_error(503, "UNAVAILABLE", "The model is overloaded. Please try again later.")
+
+
 def gemini_extractor(tmp_path, fake, *, model="gemini-test", **kwargs) -> Extractor:
-    return Extractor(GeminiProvider(api_key="test-key", model=model, client=fake),
-                     cache_dir=tmp_path / "cache", **kwargs)
+    """Extractor on a mocked Gemini client. Retry waits are recorded in .sleeps, not slept."""
+    sleeps: list[float] = []
+    extractor = Extractor(GeminiProvider(api_key="test-key", model=model, client=fake),
+                          cache_dir=tmp_path / "cache", sleep=sleeps.append, **kwargs)
+    extractor.sleeps = sleeps
+    return extractor
 
 
 def extract_clean(extractor):
@@ -115,36 +132,96 @@ def test_jpeg_documents_are_sent_as_jpeg(tmp_path):
 )
 def test_blocked_gemini_responses_fail_without_retry(tmp_path, caplog, fake_kwargs, message):
     fake = FakeGemini(default=faithful_reply(CLEAN_DOC), **fake_kwargs)
+    extractor = gemini_extractor(tmp_path, fake)
     with caplog.at_level(logging.WARNING, logger="verifyonce.extraction"):
-        result = extract_clean(gemini_extractor(tmp_path, fake))
+        result = extract_clean(extractor)
     assert (result.status, result.error, result.attempts, len(fake.calls)) == ("failed", message, 1, 1)
+    assert extractor.sleeps == []
     assert "Sent to officer review" in caplog.text
 
 
-def test_gemini_quota_error_fails_cleanly_and_is_logged(tmp_path, caplog):
-    fake = FakeGemini(default=genai_errors.ClientError(429, QUOTA_ERROR))
+# --- Retry with backoff for transient errors ----------------------------------------------
+
+
+def test_default_retry_waits_are_2s_then_5s():
+    assert Extractor(GeminiProvider(api_key="k")).retry_delays == (2.0, 5.0)
+
+
+@pytest.mark.parametrize(
+    "transient",
+    [unavailable, quota, lambda: gemini_error(500, "INTERNAL", "Internal error"),
+     lambda: httpx2.ReadTimeout("read timed out"), lambda: httpx2.ConnectError("connection reset")],
+    ids=["503", "429", "500", "timeout", "connection"],
+)
+def test_transient_error_is_retried_then_succeeds(tmp_path, caplog, transient):
+    fake = FakeGemini(default=[transient(), transient(), faithful_reply(CLEAN_DOC)])
+    extractor = gemini_extractor(tmp_path, fake)
     with caplog.at_level(logging.WARNING, logger="verifyonce.extraction"):
-        result = extract_clean(gemini_extractor(tmp_path, fake))
-    assert result.status == "failed"
-    assert result.error.startswith("Gemini quota or rate limit reached (HTTP 429 RESOURCE_EXHAUSTED)")
-    assert len(fake.calls) == 1  # no retry against a quota limit
-    assert "quota or rate limit" in caplog.text and "Sent to officer review" in caplog.text
+        result = extract_clean(extractor)
+    assert (result.status, result.attempts, len(fake.calls)) == ("ok", 3, 3)
+    assert result.readings["marks_percent"]["value"] == 52.0
+    assert extractor.sleeps == [2.0, 5.0]
+    retries = [r.getMessage() for r in caplog.records if "Retrying" in r.getMessage()]
+    assert len(retries) == 2
+    assert retries[0].endswith("Retrying in 2s (attempt 2 of 3).")
+    assert retries[1].endswith("Retrying in 5s (attempt 3 of 3).")
+
+
+def test_one_transient_error_needs_only_one_wait(tmp_path):
+    fake = FakeGemini(default=[unavailable(), faithful_reply(CLEAN_DOC)])
+    extractor = gemini_extractor(tmp_path, fake)
+    result = extract_clean(extractor)
+    assert (result.status, result.attempts, extractor.sleeps) == ("ok", 2, [2.0])
+
+
+def test_transient_error_that_persists_fails_after_three_attempts(tmp_path, caplog):
+    fake = FakeGemini(default=[unavailable(), unavailable(), unavailable(), faithful_reply(CLEAN_DOC)])
+    extractor = gemini_extractor(tmp_path, fake)
+    with caplog.at_level(logging.WARNING, logger="verifyonce.extraction"):
+        result = extract_clean(extractor)
+    assert (result.status, result.attempts, len(fake.calls)) == ("failed", 3, 3)
+    assert result.error == ("Gemini API error 503 UNAVAILABLE: The model is overloaded. Please try again later. "
+                            "Gave up after 3 attempts.")
+    assert extractor.sleeps == [2.0, 5.0]
+    assert sum("Retrying" in r.getMessage() for r in caplog.records) == 2
+    assert "Sent to officer review" in caplog.text
+
+
+def test_quota_error_that_persists_fails_cleanly(tmp_path):
+    fake = FakeGemini(default=quota())
+    extractor = gemini_extractor(tmp_path, fake)
+    result = extract_clean(extractor)
+    assert result.status == "failed" and len(fake.calls) == 3
+    assert result.error == ("Gemini quota or rate limit reached (HTTP 429 RESOURCE_EXHAUSTED). Wait and retry, "
+                            "or check the quota for this API key. Gave up after 3 attempts.")
 
 
 @pytest.mark.parametrize(
     ("error", "message"),
     [
-        (genai_errors.ServerError(503, {"error": {"code": 503, "message": "overloaded", "status": "UNAVAILABLE"}}),
-         "Gemini API error 503 UNAVAILABLE: overloaded"),
-        (genai_errors.ClientError(400, {"error": {"code": 400, "message": "API key not valid.",
-                                                  "status": "INVALID_ARGUMENT"}}),
-         "Gemini API error 400 INVALID_ARGUMENT: API key not valid."),
-        (httpx2.ConnectError("connection refused"), "Could not reach the Gemini API"),
+        (gemini_error(400, "INVALID_ARGUMENT", "API key not valid. Please pass a valid API key."),
+         "Gemini API error 400 INVALID_ARGUMENT: API key not valid. Please pass a valid API key."),
+        (gemini_error(401, "UNAUTHENTICATED", "Request had invalid authentication credentials."),
+         "Gemini API error 401 UNAUTHENTICATED: Request had invalid authentication credentials."),
+        (gemini_error(403, "PERMISSION_DENIED", "Permission denied."),
+         "Gemini API error 403 PERMISSION_DENIED: Permission denied."),
+        (gemini_error(404, "NOT_FOUND", "models/gemini-nope is not found."),
+         "Gemini API error 404 NOT_FOUND: models/gemini-nope is not found."),
     ],
+    ids=["400-bad-key", "401", "403", "404-model"],
 )
-def test_gemini_api_and_network_errors_fail_cleanly(tmp_path, error, message):
-    result = extract_clean(gemini_extractor(tmp_path, FakeGemini(default=error)))
-    assert (result.status, result.error) == ("failed", message)
+def test_authentication_and_client_errors_are_not_retried(tmp_path, error, message):
+    fake = FakeGemini(default=error)
+    extractor = gemini_extractor(tmp_path, fake)
+    result = extract_clean(extractor)
+    assert (result.status, result.error, len(fake.calls), extractor.sleeps) == ("failed", message, 1, [])
+
+
+def test_schema_retry_and_transient_retry_combine(tmp_path):
+    fake = FakeGemini(default=[unavailable(), "not json", faithful_reply(CLEAN_DOC)])
+    extractor = gemini_extractor(tmp_path, fake)
+    result = extract_clean(extractor)
+    assert (result.status, result.attempts, extractor.sleeps) == ("ok", 3, [2.0])
 
 
 def test_missing_gemini_key_fails_without_calling_anything(tmp_path):
@@ -242,8 +319,7 @@ def test_cache_mode_reuses_a_real_live_result(tmp_path):
 
 
 def test_failed_extractions_are_never_cached(tmp_path):
-    for fake in (FakeGemini(default=["nope", "still nope"]),
-                 FakeGemini(default=genai_errors.ClientError(429, QUOTA_ERROR))):
+    for fake in (FakeGemini(default=["nope", "still nope"]), FakeGemini(default=quota())):
         assert extract_clean(gemini_extractor(tmp_path, fake, use_cache=True)).status == "failed"
     assert not (tmp_path / "cache").exists() or not any((tmp_path / "cache").iterdir())
 
@@ -264,7 +340,16 @@ def test_cache_from_another_model_or_provider_is_ignored(tmp_path):
 
 
 def anthropic_extractor(tmp_path, fake, model="claude-opus-5-5") -> Extractor:
-    return Extractor(AnthropicProvider(api_key="test-key", model=model, client=fake), cache_dir=tmp_path / "cache")
+    sleeps: list[float] = []
+    extractor = Extractor(AnthropicProvider(api_key="test-key", model=model, client=fake),
+                          cache_dir=tmp_path / "cache", sleep=sleeps.append)
+    extractor.sleeps = sleeps
+    return extractor
+
+
+def anthropic_error(cls, code: int):
+    response = httpx2.Response(code, request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"))
+    return cls(f"HTTP {code}", response=response, body=None)
 
 
 def test_anthropic_request_shape_without_fallbacks_or_sampling(tmp_path):
@@ -288,12 +373,28 @@ def test_anthropic_refusal_goes_straight_to_review(tmp_path):
         "failed", "The model declined to read this document", 1)
 
 
-def test_anthropic_rate_limit_fails_cleanly(tmp_path):
-    response = httpx2.Response(429, request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"))
-    fake = FakeAnthropic(default=anthropic.RateLimitError("rate limited", response=response, body=None))
-    result = extract_clean(anthropic_extractor(tmp_path, fake))
-    assert result.status == "failed"
+def test_anthropic_rate_limit_fails_cleanly_after_retries(tmp_path):
+    fake = FakeAnthropic(default=anthropic_error(anthropic.RateLimitError, 429))
+    extractor = anthropic_extractor(tmp_path, fake)
+    result = extract_clean(extractor)
+    assert (result.status, len(fake.calls), extractor.sleeps) == ("failed", 3, [2.0, 5.0])
     assert result.error.startswith("Anthropic rate limit or quota reached (HTTP 429)")
+    assert result.error.endswith("Gave up after 3 attempts.")
+
+
+def test_anthropic_overload_is_retried_then_succeeds(tmp_path):
+    fake = FakeAnthropic(default=[anthropic_error(anthropic.InternalServerError, 529), faithful_reply(CLEAN_DOC)])
+    extractor = anthropic_extractor(tmp_path, fake)
+    result = extract_clean(extractor)
+    assert (result.status, result.attempts, extractor.sleeps) == ("ok", 2, [2.0])
+
+
+def test_anthropic_authentication_error_is_not_retried(tmp_path):
+    fake = FakeAnthropic(default=anthropic_error(anthropic.AuthenticationError, 401))
+    extractor = anthropic_extractor(tmp_path, fake)
+    result = extract_clean(extractor)
+    assert (result.status, len(fake.calls), extractor.sleeps) == ("failed", 1, [])
+    assert result.error.startswith("Anthropic API error 401")
 
 
 def test_missing_anthropic_key_fails_without_calling_anything(tmp_path):

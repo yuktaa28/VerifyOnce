@@ -222,6 +222,6 @@ def fake_gemini() -> FakeGemini:
 def upload_client(settings, fake_gemini) -> Iterator[TestClient]:
     """API client whose extractor talks to the default provider, Gemini, mocked."""
     provider = GeminiProvider(api_key="test-key", model="gemini-test", client=fake_gemini)
-    extractor = Extractor(provider, cache_dir=settings.cache_dir)
+    extractor = Extractor(provider, cache_dir=settings.cache_dir, sleep=lambda _seconds: None)
     with TestClient(create_app(settings, extractor=extractor)) as test_client:
         yield test_client
