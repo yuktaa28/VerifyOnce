@@ -135,6 +135,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             "extraction": {
                 "extraction_source": result.extraction_source,
                 "status": result.status,
+                "provider": result.provider,
                 "model": result.model,
                 "attempts": result.attempts,
                 "error": result.error,

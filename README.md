@@ -1,6 +1,6 @@
 # VerifyOnce
 
-Verify a citizen once, then reuse that verification for every scheme. Citizens upload their documents one time to build a verified profile. Claude reads the fields from each document image, deterministic checks verify or flag every fact, and an evaluator checks each application against the scheme's rules, citing the documents behind every decision. An officer reviews only the uncertain cases.
+Verify a citizen once, then reuse that verification for every scheme. Citizens upload their documents one time to build a verified profile. A vision model (Gemini by default, on Google's free tier) reads the fields from each document image, deterministic checks verify or flag every fact, and an evaluator checks each application against the scheme's rules, citing the documents behind every decision. An officer reviews only the uncertain cases.
 
 Built for Homingo Hackathon Edition 01, Automation track, problem statement B2: AI for the government office. All people, documents and schemes in this repo are fictional.
 
@@ -30,8 +30,11 @@ Then edit `.env` and fill in your own values. `.env` is git-ignored: never commi
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | (none) | Needed for live extraction. Without it every upload is flagged for review. |
-| `ANTHROPIC_MODEL` | `claude-opus-5-5` | Model used to read documents |
+| `EXTRACTION_PROVIDER` | `gemini` | `gemini` (free tier) or `anthropic` (paid) |
+| `GEMINI_API_KEY` | (none) | Needed for live extraction with Gemini. A free key comes from Google AI Studio. Without it, every upload is flagged for review. |
+| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model used to read documents. Set it to any vision model your key can use. |
+| `ANTHROPIC_API_KEY` | (none) | Only needed when `EXTRACTION_PROVIDER=anthropic` |
+| `ANTHROPIC_MODEL` | `claude-opus-5-5` | Model used when the provider is `anthropic` |
 | `EXTRACTION_USE_CACHE` | off | `1` reads cached results from `data/cache/` first; live is the default |
 | `VERIFY_ONCE_DB` | `data/verifyonce.db` | SQLite file path, or a full SQLAlchemy URL |
 | `VERIFY_ONCE_CONFIDENCE_CUTOFF` | `0.80` | Evidence below this confidence is flagged |
@@ -47,7 +50,7 @@ python -m pytest                            # all offline tests (the model is mo
 python scripts/run_seed_cases.py            # every seed profile x every scheme, expected vs actual
 python scripts/make_documents.py            # regenerate the synthetic documents
 python scripts/live_check.py --injection    # real extraction of the clean, blurry and injection marksheets
-python -m pytest -m live --run-live -s      # opt-in tests against the real API (spends credits)
+python -m pytest -m live --run-live -s      # opt-in tests against the real provider (3 API calls)
 ```
 
 After pulling a step that changes the data model, run `python scripts/seed.py --reset`. The database has no migrations yet.
@@ -72,11 +75,13 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
 
 ## How a document becomes facts
 
-1. **Extraction** (`backend/extraction.py`). Claude vision reads the image into a fixed schema per document type: each field has a `value` (null if unreadable, never guessed) and a `confidence` from 0 to 1.
+1. **Extraction** (`backend/extraction.py`). A vision model reads the image into a fixed schema per document type: each field has a `value` (null if unreadable, never guessed) and a `confidence` from 0 to 1.
+   - **Provider:** Gemini by default (google-genai SDK, `temperature` 0, JSON output constrained by `response_json_schema`), or Anthropic with `EXTRACTION_PROVIDER=anthropic`. The prompt, schema, retry and cache are the same for both.
    - The system prompt says document text is untrusted data, that instructions inside a document are ignored, and that the reply is only JSON.
-   - Structured outputs constrain the reply, and Pydantic re-checks it with extra keys forbidden.
+   - The provider constrains the reply to the JSON schema, and Pydantic re-checks it with extra keys forbidden.
    - An invalid reply gets one retry. A second failure stores every field empty, so the document goes to an officer.
-   - Results are cached by file hash in `data/cache/`, written only by real live runs. Each result says `live` or `cache`.
+   - **Failures go straight to officer review:** a refusal, a blocked response (Gemini safety blocks included), an API or network error, or a quota / rate limit (HTTP 429). There is no fallback model and no crash. The upload returns `extraction_failed`, every field is flagged, and the reason is logged and returned in `extraction.error`.
+   - Results are cached by file hash in `data/cache/`, written only by real live runs. Each result says `live` or `cache`, and which provider and model produced it.
    - The model never sees scheme rules and never decides anything.
 2. **Verification** (`backend/verification.py`). Each fact moves from `unverified` to `verified` or `flagged`. It is flagged when:
    - its value is null (model confidence is not calibrated, so a null is always flagged),
@@ -86,7 +91,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
 
    Each new upload re-checks the whole profile, so a later document can flag an earlier fact. Facts an officer has reviewed keep the officer's status.
 
-**No `temperature` is sent.** The installed Anthropic SDK (2.x) uses API version 2026-10-21, which rejects `temperature`, `top_p` and `top_k` on every model. Consistency comes from schema-constrained output and the deterministic checks instead.
+**Sampling.** Gemini is called with `temperature` 0. The Anthropic provider sends no `temperature`: the installed Anthropic SDK (2.x) uses API version 2026-10-21, which rejects `temperature`, `top_p` and `top_k` on every model.
 
 **Known limit.** A model that obeyed an instruction hidden in a document *and* kept to the schema (for example reporting marks as 99) would not be caught by the schema. The prompt and the live injection test cover that; cross-checks within a document (subject totals against the percentage) would be a further defence.
 

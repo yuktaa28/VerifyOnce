@@ -1,6 +1,6 @@
 """Runtime settings from environment variables and the repo's .env file (via python-dotenv).
 
-The Anthropic API key is held here but never printed: it is excluded from repr().
+API keys are held here but never printed: they are excluded from repr().
 """
 
 from __future__ import annotations
@@ -15,7 +15,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = REPO_ROOT / "data" / "verifyonce.db"
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache"
 DEFAULT_CONFIDENCE_CUTOFF = 0.80
+DEFAULT_EXTRACTION_PROVIDER = "gemini"
+DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5-5"
+EXTRACTION_PROVIDERS = ("gemini", "anthropic")
 
 
 def load_env_file(path: Path = REPO_ROOT / ".env") -> None:
@@ -42,6 +45,9 @@ class Settings:
     database_url: str
     schemes_dir: Path = REPO_ROOT / "schemes"
     confidence_cutoff: float = DEFAULT_CONFIDENCE_CUTOFF
+    extraction_provider: str = DEFAULT_EXTRACTION_PROVIDER
+    gemini_api_key: str | None = field(default=None, repr=False)
+    gemini_model: str = DEFAULT_GEMINI_MODEL
     anthropic_api_key: str | None = field(default=None, repr=False)
     anthropic_model: str = DEFAULT_ANTHROPIC_MODEL
     extraction_use_cache: bool = False
@@ -50,6 +56,22 @@ class Settings:
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence_cutoff <= 1.0:
             raise ValueError("confidence_cutoff must be between 0 and 1")
+        if self.extraction_provider not in EXTRACTION_PROVIDERS:
+            raise ValueError(f"EXTRACTION_PROVIDER must be one of {EXTRACTION_PROVIDERS}")
+
+    @property
+    def provider_key_set(self) -> bool:
+        """Whether the selected provider has an API key (never the key itself)."""
+        key = self.gemini_api_key if self.extraction_provider == "gemini" else self.anthropic_api_key
+        return bool(key)
+
+    @property
+    def provider_key_name(self) -> str:
+        return "GEMINI_API_KEY" if self.extraction_provider == "gemini" else "ANTHROPIC_API_KEY"
+
+    @property
+    def provider_model(self) -> str:
+        return self.gemini_model if self.extraction_provider == "gemini" else self.anthropic_model
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -58,6 +80,9 @@ class Settings:
         return cls(
             database_url=database_url(os.environ.get("VERIFY_ONCE_DB")),
             confidence_cutoff=float(cutoff),
+            extraction_provider=(os.environ.get("EXTRACTION_PROVIDER") or DEFAULT_EXTRACTION_PROVIDER).strip().lower(),
+            gemini_api_key=os.environ.get("GEMINI_API_KEY") or None,
+            gemini_model=os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
             anthropic_model=os.environ.get("ANTHROPIC_MODEL") or DEFAULT_ANTHROPIC_MODEL,
             extraction_use_cache=_flag(os.environ.get("EXTRACTION_USE_CACHE")),

@@ -1,18 +1,24 @@
-"""Read fields from a document image with Claude vision.
+"""Read fields from a document image with a vision model.
+
+The provider is chosen with ``EXTRACTION_PROVIDER``: ``gemini`` (default, Google's free
+tier through the google-genai SDK) or ``anthropic``. Everything else is shared:
 
 * The image is untrusted. The system prompt says document text is data, that
   instructions inside a document are ignored, and that the reply is only JSON.
-* The reply must match a per-document-type schema. Structured outputs constrain it
-  on the API side, and Pydantic checks it again here with extra keys forbidden.
+* The reply must match a per-document-type schema. The provider constrains it with
+  the same JSON schema, and Pydantic checks it again here with extra keys forbidden.
 * An invalid reply gets one fresh retry. If that also fails, the extraction fails and
   every field of the document is stored empty, which routes it to an officer.
+* A refusal or blocked response, an API error, or a quota / rate limit (HTTP 429)
+  fails the extraction at once, without a crash and without a fallback model. The
+  failure is logged and the document goes to an officer.
 * The model only reads fields. It never sees scheme rules and never decides a verdict.
 * Results are cached by file hash in ``data/cache/``. Live extraction is the default.
   ``EXTRACTION_USE_CACHE=1`` reads the cache first. Only successful live results are
   ever written to the cache, and every result says whether it is ``live`` or ``cache``.
 
-No sampling parameters are sent: on the API version the installed SDK uses
-(2026-10-21), ``temperature`` returns a 400 on every model.
+Sampling: Gemini is called with temperature 0. Anthropic gets no sampling parameters,
+because API version 2026-10-21 (anthropic SDK 2.x) rejects them on every model.
 """
 
 from __future__ import annotations
@@ -21,29 +27,36 @@ import base64
 import hashlib
 import io
 import json
+import logging
 import re
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import anthropic
+import httpx2
+from google import genai
+from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 from PIL import Image, UnidentifiedImageError
 from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr, ValidationError
 
-from backend.config import DEFAULT_ANTHROPIC_MODEL, DEFAULT_CACHE_DIR, Settings
+from backend.config import (
+    DEFAULT_ANTHROPIC_MODEL,
+    DEFAULT_CACHE_DIR,
+    DEFAULT_GEMINI_MODEL,
+    Settings,
+)
 from backend.fields import document_label
 
+log = logging.getLogger("verifyonce.extraction")
+
 PROMPT_VERSION = "2026-11-23.1"
-MAX_TOKENS = 16000
+MAX_TOKENS = 16000  # Anthropic only; Gemini uses the model's default output limit
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_IMAGE_SIDE = 8000
 MEDIA_TYPES = {"PNG": "image/png", "JPEG": "image/jpeg", "GIF": "image/gif", "WEBP": "image/webp"}
-
-# Models that accept server-side refusal fallbacks. On a refusal the API re-runs the
-# request on a fallback model; the model that actually answered is recorded.
-FALLBACK_MODELS = {"claude-fable-5-2", "claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
-FALLBACK_BETA = "server-side-fallback-2026-07-01"
 
 
 # --- Schemas ------------------------------------------------------------------------------
@@ -117,7 +130,7 @@ _VALUE_SCHEMAS: dict[type[BaseModel], dict[str, Any]] = {
 
 
 def response_schema(document_type: str) -> dict[str, Any]:
-    """JSON schema for structured outputs (no numeric bounds: the API does not support them)."""
+    """JSON schema sent to the provider (no numeric bounds; Pydantic enforces those)."""
     properties = {}
     for name, info in DOCUMENT_SCHEMAS[document_type].model_fields.items():
         properties[name] = {
@@ -153,6 +166,175 @@ def system_prompt(document_type: str) -> str:
     return SYSTEM_PROMPT.format(label=document_label(document_type), fields=fields)
 
 
+# --- Providers ----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ModelRequest:
+    system: str
+    image: bytes
+    media_type: str
+    texts: tuple[str, ...]
+    schema: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ModelReply:
+    text: str
+    model: str
+    blocked: str | None = None  # why the model refused or the provider blocked the reply
+
+
+class ProviderError(Exception):
+    """The call failed (API error, network, quota). ``quota`` marks HTTP 429 / exhausted quota."""
+
+    def __init__(self, message: str, *, quota: bool = False) -> None:
+        super().__init__(message)
+        self.quota = quota
+
+
+class Provider(Protocol):
+    name: str
+    model: str
+
+    def missing_configuration(self) -> str | None: ...
+
+    def generate(self, request: ModelRequest) -> ModelReply: ...
+
+
+def _enum_name(value: Any) -> str | None:
+    return None if value is None else getattr(value, "name", str(value))
+
+
+_GEMINI_NORMAL_FINISH = {None, "STOP", "MAX_TOKENS", "FINISH_REASON_UNSPECIFIED"}
+
+
+class GeminiProvider:
+    """Google Gemini through the google-genai SDK (works on the free tier)."""
+
+    name = "gemini"
+
+    def __init__(self, *, api_key: str | None, model: str = DEFAULT_GEMINI_MODEL, client: Any = None) -> None:
+        self._api_key = api_key
+        self._client = client
+        self.model = model
+
+    def __repr__(self) -> str:  # never show the key
+        return f"GeminiProvider(model={self.model!r})"
+
+    def missing_configuration(self) -> str | None:
+        if self._client is None and not self._api_key:
+            return "GEMINI_API_KEY is not set, so the document could not be read"
+        return None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            self._client = genai.Client(api_key=self._api_key)
+        return self._client
+
+    def generate(self, request: ModelRequest) -> ModelReply:
+        config = genai_types.GenerateContentConfig(
+            system_instruction=request.system,
+            response_mime_type="application/json",
+            response_json_schema=request.schema,
+            temperature=0,
+        )
+        contents = [genai_types.Part.from_bytes(data=request.image, mime_type=request.media_type), *request.texts]
+        try:
+            response = self._get_client().models.generate_content(model=self.model, contents=contents, config=config)
+        except genai_errors.APIError as exc:
+            if exc.code == 429 or exc.status == "RESOURCE_EXHAUSTED":
+                raise ProviderError(
+                    f"Gemini quota or rate limit reached (HTTP 429 {exc.status or 'RESOURCE_EXHAUSTED'}). "
+                    "Wait and retry, or check the quota for this API key.",
+                    quota=True,
+                ) from None
+            raise ProviderError(f"Gemini API error {exc.code} {exc.status}: {exc.message}") from None
+        except (httpx2.TransportError, OSError):
+            raise ProviderError("Could not reach the Gemini API") from None
+
+        model = getattr(response, "model_version", None) or self.model
+        feedback = getattr(response, "prompt_feedback", None)
+        block_reason = _enum_name(getattr(feedback, "block_reason", None)) if feedback else None
+        if block_reason:
+            return ModelReply("", model, blocked=f"Gemini blocked the document ({block_reason})")
+        candidates = getattr(response, "candidates", None) or []
+        if not candidates:
+            return ModelReply("", model, blocked="Gemini returned no answer for the document")
+        finish = _enum_name(getattr(candidates[0], "finish_reason", None))
+        text = getattr(response, "text", None) or ""
+        if finish not in _GEMINI_NORMAL_FINISH:
+            return ModelReply(text, model, blocked=f"Gemini stopped without an answer ({finish})")
+        return ModelReply(text, model)
+
+
+class AnthropicProvider:
+    """Anthropic Claude through the anthropic SDK (paid API)."""
+
+    name = "anthropic"
+
+    def __init__(self, *, api_key: str | None, model: str = DEFAULT_ANTHROPIC_MODEL, client: Any = None) -> None:
+        self._api_key = api_key
+        self._client = client
+        self.model = model
+
+    def __repr__(self) -> str:  # never show the key
+        return f"AnthropicProvider(model={self.model!r})"
+
+    def missing_configuration(self) -> str | None:
+        if self._client is None and not self._api_key:
+            return "ANTHROPIC_API_KEY is not set, so the document could not be read"
+        return None
+
+    def _get_client(self) -> Any:
+        if self._client is None:
+            self._client = anthropic.Anthropic(api_key=self._api_key)
+        return self._client
+
+    def generate(self, request: ModelRequest) -> ModelReply:
+        image = {
+            "type": "image",
+            "source": {"type": "base64", "media_type": request.media_type,
+                       "data": base64.standard_b64encode(request.image).decode()},
+        }
+        try:
+            response = self._get_client().messages.create(
+                model=self.model,
+                max_tokens=MAX_TOKENS,
+                system=request.system,
+                messages=[{"role": "user", "content": [image, *({"type": "text", "text": t} for t in request.texts)]}],
+                output_config={"format": {"type": "json_schema", "schema": request.schema}},
+            )
+        except anthropic.APIStatusError as exc:
+            if exc.status_code == 429:
+                raise ProviderError(
+                    "Anthropic rate limit or quota reached (HTTP 429). Wait and retry, or check your plan.",
+                    quota=True,
+                ) from None
+            raise ProviderError(f"Anthropic API error {exc.status_code}: {exc.message}") from None
+        except anthropic.APIConnectionError:
+            raise ProviderError("Could not reach the Anthropic API") from None
+        except anthropic.APIError as exc:
+            raise ProviderError(f"Anthropic API error: {type(exc).__name__}") from None
+
+        text = "".join(getattr(b, "text", "") for b in response.content if getattr(b, "type", None) == "text")
+        model = getattr(response, "model", None) or self.model
+        if getattr(response, "stop_reason", None) == "refusal":
+            return ModelReply(text, model, blocked="The model declined to read this document")
+        return ModelReply(text, model)
+
+
+PROVIDERS = ("gemini", "anthropic")
+
+
+def make_provider(settings: Settings, *, client: Any = None) -> Provider:
+    if settings.extraction_provider == "gemini":
+        return GeminiProvider(api_key=settings.gemini_api_key, model=settings.gemini_model, client=client)
+    if settings.extraction_provider == "anthropic":
+        return AnthropicProvider(api_key=settings.anthropic_api_key, model=settings.anthropic_model, client=client)
+    raise ValueError(f"EXTRACTION_PROVIDER must be one of {PROVIDERS}, not {settings.extraction_provider!r}")
+
+
 # --- Results ------------------------------------------------------------------------------
 
 
@@ -162,6 +344,7 @@ class ExtractionResult:
     sha256: str
     extraction_source: str  # "live" or "cache"
     status: str  # "ok" or "failed"
+    provider: str
     model: str | None
     readings: dict[str, dict[str, Any]] = field(default_factory=dict)  # field -> {value, confidence}
     raw_responses: list[str] = field(default_factory=list)
@@ -236,33 +419,22 @@ def image_media_type(content: bytes) -> str:
 
 
 class Extractor:
-    def __init__(
-        self,
-        *,
-        api_key: str | None = None,
-        model: str = DEFAULT_ANTHROPIC_MODEL,
-        use_cache: bool = False,
-        cache_dir: Path = DEFAULT_CACHE_DIR,
-        client: Any = None,
-    ) -> None:
-        self._api_key = api_key
-        self._client = client
-        self.model = model
+    def __init__(self, provider: Provider, *, use_cache: bool = False, cache_dir: Path = DEFAULT_CACHE_DIR) -> None:
+        self.provider = provider
         self.use_cache = use_cache
         self.cache_dir = Path(cache_dir)
 
-    def __repr__(self) -> str:  # never show the key
-        return f"Extractor(model={self.model!r}, use_cache={self.use_cache}, cache_dir={str(self.cache_dir)!r})"
+    @property
+    def model(self) -> str:
+        return self.provider.model
+
+    def __repr__(self) -> str:
+        return f"Extractor({self.provider!r}, use_cache={self.use_cache}, cache_dir={str(self.cache_dir)!r})"
 
     @classmethod
     def from_settings(cls, settings: Settings, *, client: Any = None) -> "Extractor":
-        return cls(
-            api_key=settings.anthropic_api_key,
-            model=settings.anthropic_model,
-            use_cache=settings.extraction_use_cache,
-            cache_dir=settings.cache_dir,
-            client=client,
-        )
+        return cls(make_provider(settings, client=client), use_cache=settings.extraction_use_cache,
+                   cache_dir=settings.cache_dir)
 
     def extract(self, content: bytes, document_type: str) -> ExtractionResult:
         """Read one document. Never raises for API or model problems: returns a failed result."""
@@ -276,89 +448,63 @@ class Extractor:
         result = self._extract_live(content, document_type, sha256)
         if result.ok:
             self._write_cache(result)
+        else:
+            log.warning("Extraction failed for %s %s (%s): %s. Sent to officer review.",
+                        document_type, sha256[:12], self.provider.name, result.error)
         return result
 
     # -- live ------------------------------------------------------------------------------
 
-    def _failed(self, document_type: str, sha256: str, error: str, **extra: Any) -> ExtractionResult:
-        return ExtractionResult(document_type, sha256, "live", "failed", extra.pop("model", self.model),
-                                error=error, **extra)
-
-    def _client_or_none(self) -> Any:
-        if self._client is None and self._api_key:
-            self._client = anthropic.Anthropic(api_key=self._api_key)
-        return self._client
+    def _result(self, document_type: str, sha256: str, status: str, **fields: Any) -> ExtractionResult:
+        fields.setdefault("model", self.provider.model)
+        return ExtractionResult(document_type=document_type, sha256=sha256, extraction_source="live",
+                                status=status, provider=self.provider.name, **fields)
 
     def _extract_live(self, content: bytes, document_type: str, sha256: str) -> ExtractionResult:
         try:
             media_type = image_media_type(content)
         except ValueError as exc:
-            return self._failed(document_type, sha256, str(exc))
-        client = self._client_or_none()
-        if client is None:
-            return self._failed(document_type, sha256, "ANTHROPIC_API_KEY is not set, so the document could not be read")
+            return self._result(document_type, sha256, "failed", error=str(exc))
+        missing = self.provider.missing_configuration()
+        if missing:
+            return self._result(document_type, sha256, "failed", error=missing)
 
-        image_block = {
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": base64.standard_b64encode(content).decode()},
-        }
         instruction = f"Extract the fields from this {document_label(document_type)}."
         raw_responses: list[str] = []
-        served_model = self.model
+        served_model = self.provider.model
         last_error = ""
         for attempt in (1, 2):
-            text_blocks = [{"type": "text", "text": instruction}]
+            texts = [instruction]
             if attempt == 2:
-                text_blocks.append({
-                    "type": "text",
-                    "text": f"A previous attempt did not return valid JSON for the schema ({last_error}). "
-                            "Reply with only the JSON object.",
-                })
+                texts.append(f"A previous attempt did not return valid JSON for the schema ({last_error}). "
+                             "Reply with only the JSON object.")
+            request = ModelRequest(system_prompt(document_type), content, media_type, tuple(texts),
+                                   response_schema(document_type))
             try:
-                response = self._send(client, document_type, [image_block, *text_blocks])
-            except anthropic.APIStatusError as exc:
-                return self._failed(document_type, sha256, f"Anthropic API error {exc.status_code}: {exc.message}",
-                                    raw_responses=raw_responses, attempts=attempt)
-            except anthropic.APIConnectionError:
-                return self._failed(document_type, sha256, "Could not reach the Anthropic API",
-                                    raw_responses=raw_responses, attempts=attempt)
-            except anthropic.APIError as exc:
-                return self._failed(document_type, sha256, f"Anthropic API error: {type(exc).__name__}",
+                reply = self.provider.generate(request)
+            except ProviderError as exc:
+                return self._result(document_type, sha256, "failed", error=str(exc),
                                     raw_responses=raw_responses, attempts=attempt)
 
-            served_model = getattr(response, "model", None) or self.model
-            text = _scrub_long_numbers(
-                "".join(getattr(b, "text", "") for b in response.content if getattr(b, "type", None) == "text")
-            )
-            raw_responses.append(text)
-            if getattr(response, "stop_reason", None) == "refusal":
-                return self._failed(document_type, sha256, "The model declined to read this document",
-                                    model=served_model, raw_responses=raw_responses, attempts=attempt)
+            served_model = reply.model
+            text = _scrub_long_numbers(reply.text)
+            if text:
+                raw_responses.append(text)
+            if reply.blocked:
+                return self._result(document_type, sha256, "failed", model=served_model, error=reply.blocked,
+                                    raw_responses=raw_responses, attempts=attempt)
             try:
                 parsed = _parse_reply(document_type, text)
             except ValidationError as exc:
                 last_error = _short_errors(exc)
                 continue
             readings = {name: reading.model_dump() for name, reading in parsed}
-            return ExtractionResult(document_type, sha256, "live", "ok", served_model, readings,
-                                    raw_responses, attempts=attempt)
+            return self._result(document_type, sha256, "ok", model=served_model, readings=readings,
+                                raw_responses=raw_responses, attempts=attempt)
 
-        return self._failed(
-            document_type, sha256, f"Reply did not match the schema after one retry: {last_error}",
-            model=served_model, raw_responses=raw_responses, attempts=2,
-        )
-
-    def _send(self, client: Any, document_type: str, content: list[dict[str, Any]]) -> Any:
-        request = {
-            "model": self.model,
-            "max_tokens": MAX_TOKENS,
-            "system": system_prompt(document_type),
-            "messages": [{"role": "user", "content": content}],
-            "output_config": {"format": {"type": "json_schema", "schema": response_schema(document_type)}},
-        }
-        if self.model in FALLBACK_MODELS:
-            return client.beta.messages.create(**request, betas=[FALLBACK_BETA], fallbacks="default")
-        return client.messages.create(**request)
+        return self._result(document_type, sha256, "failed", model=served_model,
+                            error=f"Reply did not match the schema after one retry: {last_error}",
+                            raw_responses=raw_responses, attempts=2)
 
     # -- cache -----------------------------------------------------------------------------
 
@@ -371,17 +517,19 @@ class Extractor:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return None
-        if (data.get("prompt_version"), data.get("requested_model"), data.get("document_type")) != (
-            PROMPT_VERSION, self.model, document_type
-        ):
+        wanted = (PROMPT_VERSION, self.provider.name, self.provider.model, document_type)
+        if (data.get("prompt_version"), data.get("provider"), data.get("requested_model"),
+                data.get("document_type")) != wanted:
             return None
         try:
             readings = DOCUMENT_SCHEMAS[document_type].model_validate(data["readings"])
         except (KeyError, ValidationError):
             return None
         return ExtractionResult(
-            document_type, sha256, "cache", "ok", data.get("served_model"),
-            {name: r.model_dump() for name, r in readings}, list(data.get("raw_responses", [])), attempts=0,
+            document_type=document_type, sha256=sha256, extraction_source="cache", status="ok",
+            provider=self.provider.name, model=data.get("served_model"),
+            readings={name: r.model_dump() for name, r in readings},
+            raw_responses=list(data.get("raw_responses", [])), attempts=0,
         )
 
     def _write_cache(self, result: ExtractionResult) -> None:
@@ -389,7 +537,8 @@ class Extractor:
             return  # the cache only ever holds successful live results
         payload = {
             "prompt_version": PROMPT_VERSION,
-            "requested_model": self.model,
+            "provider": result.provider,
+            "requested_model": self.provider.model,
             "served_model": result.model,
             "document_type": result.document_type,
             "sha256": result.sha256,

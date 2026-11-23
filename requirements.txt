@@ -9,4 +9,5 @@ python-multipart
 pillow
 streamlit
 anthropic
+google-genai
 python-dotenv

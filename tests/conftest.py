@@ -10,12 +10,13 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
+from google.genai import types as genai_types
 from sqlalchemy.orm import Session
 
 from backend.app import create_app
 from backend.config import REPO_ROOT, Settings
 from backend.db import init_db, make_engine, make_session_factory
-from backend.extraction import Extractor
+from backend.extraction import Extractor, GeminiProvider
 from backend.schemes import Scheme, load_schemes
 from backend.seed import seed_database
 
@@ -40,48 +41,95 @@ def pytest_collection_modifyitems(config, items):
 
 @pytest.fixture(autouse=True)
 def _no_real_api_outside_live_tests(request, monkeypatch):
-    """Non-live tests must never build a real Anthropic client, even if .env holds a key."""
+    """Non-live tests must never build a real API client, even if .env holds a key."""
     if request.node.get_closest_marker("live"):
         return
 
     def refuse(*_args, **_kwargs):
-        raise AssertionError("a non-live test tried to create a real Anthropic client")
+        raise AssertionError("a non-live test tried to create a real API client")
 
     monkeypatch.setattr("backend.extraction.anthropic.Anthropic", refuse)
+    monkeypatch.setattr("backend.extraction.genai.Client", refuse)
+
+
+def _pick_reply(replies: dict[str, Any], default: Any, sha: str, who: str) -> Any:
+    reply = replies.get(sha, default)
+    if isinstance(reply, list):
+        reply = reply.pop(0)
+    if isinstance(reply, Exception):
+        raise reply
+    if reply is None:
+        raise AssertionError(f"{who} has no reply for image {sha[:12]}")
+    return reply
+
+
+# --- Fake Gemini client (the default provider) ---------------------------------------------
+
+
+class FakeGemini:
+    """Stands in for google.genai.Client and records every generate_content call.
+
+    ``replies`` maps an image's sha256 to the reply text, or to a list of replies used
+    one per attempt. A reply may be an exception to raise (e.g. a 429 ClientError).
+    Responses are real google-genai response objects. ``finish_reason`` and
+    ``block_reason`` simulate blocked answers.
+    """
+
+    def __init__(self, replies=None, default=None, finish_reason="STOP", block_reason=None):
+        self.replies: dict[str, Any] = replies or {}
+        self.default = default
+        self.finish_reason = finish_reason
+        self.block_reason = block_reason
+        self.calls: list[dict[str, Any]] = []
+        self.models = SimpleNamespace(generate_content=self._generate_content)
+
+    def _generate_content(self, *, model, contents, config):
+        self.calls.append({"model": model, "contents": contents, "config": config})
+        sha = hashlib.sha256(contents[0].inline_data.data).hexdigest()
+        reply = _pick_reply(self.replies, self.default, sha, "FakeGemini")
+        if self.block_reason:
+            return genai_types.GenerateContentResponse(
+                candidates=[],
+                prompt_feedback=genai_types.GenerateContentResponsePromptFeedback(
+                    block_reason=genai_types.BlockedReason[self.block_reason]
+                ),
+                model_version=model,
+            )
+        return genai_types.GenerateContentResponse(
+            candidates=[genai_types.Candidate(
+                content=genai_types.Content(role="model", parts=[genai_types.Part(text=reply)]),
+                finish_reason=genai_types.FinishReason[self.finish_reason],
+            )],
+            model_version=model,
+        )
+
+    @staticmethod
+    def system(call) -> str:
+        return call["config"].system_instruction
+
+    @staticmethod
+    def texts(call) -> list[str]:
+        return [c for c in call["contents"] if isinstance(c, str)]
 
 
 # --- Fake Anthropic client ---------------------------------------------------------------
 
 
 class FakeAnthropic:
-    """Stands in for anthropic.Anthropic and records every request.
+    """Stands in for anthropic.Anthropic and records every messages.create call."""
 
-    ``replies`` maps an image's sha256 to the reply text, or to a list of replies used
-    one per attempt. A reply may also be an exception to raise. ``default`` is used
-    for images without an entry.
-    """
-
-    def __init__(self, replies: dict[str, Any] | None = None, default: Any = None, stop_reason="end_turn"):
-        self.replies = replies or {}
+    def __init__(self, replies=None, default=None, stop_reason="end_turn"):
+        self.replies: dict[str, Any] = replies or {}
         self.default = default
         self.stop_reason = stop_reason
         self.calls: list[dict[str, Any]] = []
-        self.endpoints: list[str] = []
-        self.messages = SimpleNamespace(create=lambda **kw: self._create("messages", kw))
-        self.beta = SimpleNamespace(messages=SimpleNamespace(create=lambda **kw: self._create("beta", kw)))
+        self.messages = SimpleNamespace(create=self._create)
 
-    def _create(self, endpoint: str, kwargs: dict[str, Any]) -> SimpleNamespace:
-        self.endpoints.append(endpoint)
+    def _create(self, **kwargs) -> SimpleNamespace:
         self.calls.append(kwargs)
         image = next(b for b in kwargs["messages"][0]["content"] if b["type"] == "image")
         sha = hashlib.sha256(base64.b64decode(image["source"]["data"])).hexdigest()
-        reply = self.replies.get(sha, self.default)
-        if isinstance(reply, list):
-            reply = reply.pop(0)
-        if isinstance(reply, Exception):
-            raise reply
-        if reply is None:
-            raise AssertionError(f"FakeAnthropic has no reply for image {sha[:12]}")
+        reply = _pick_reply(self.replies, self.default, sha, "FakeAnthropic")
         return SimpleNamespace(
             content=[SimpleNamespace(type="thinking", thinking=""), SimpleNamespace(type="text", text=reply)],
             stop_reason=self.stop_reason,
@@ -166,13 +214,14 @@ def bare_session(settings) -> Iterator[Session]:
 
 
 @pytest.fixture
-def fake_anthropic() -> FakeAnthropic:
-    return FakeAnthropic()
+def fake_gemini() -> FakeGemini:
+    return FakeGemini()
 
 
 @pytest.fixture
-def upload_client(settings, fake_anthropic) -> Iterator[TestClient]:
-    """API client whose extractor talks to FakeAnthropic."""
-    extractor = Extractor(model="claude-opus-5-5", client=fake_anthropic, cache_dir=settings.cache_dir)
+def upload_client(settings, fake_gemini) -> Iterator[TestClient]:
+    """API client whose extractor talks to the default provider, Gemini, mocked."""
+    provider = GeminiProvider(api_key="test-key", model="gemini-test", client=fake_gemini)
+    extractor = Extractor(provider, cache_dir=settings.cache_dir)
     with TestClient(create_app(settings, extractor=extractor)) as test_client:
         yield test_client

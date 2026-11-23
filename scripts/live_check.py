@@ -9,8 +9,10 @@ Extractor, a throwaway database), so the output shows exactly what the app store
 extraction_source, the raw model replies, each value with its confidence, and the
 verification status. The expected column comes from backend/seed.py.
 
-Needs ANTHROPIC_API_KEY (and optionally ANTHROPIC_MODEL) in .env. The key is never
-printed.
+Uses the provider set by EXTRACTION_PROVIDER (default gemini). Needs that provider's
+key in .env: GEMINI_API_KEY (optionally GEMINI_MODEL), or ANTHROPIC_API_KEY. Keys are
+never printed. A quota or rate limit (HTTP 429) shows up as a failed extraction with
+a clear error; the script does not crash.
 """
 
 from __future__ import annotations
@@ -52,8 +54,9 @@ def main(argv: list[str] | None = None) -> int:
     sys.stdout.reconfigure(encoding="utf-8")
 
     base = Settings.from_env()
-    print(f"ANTHROPIC_API_KEY: {'set' if base.anthropic_api_key else 'NOT SET'}")
-    print(f"ANTHROPIC_MODEL:   {base.anthropic_model}")
+    print(f"Provider:          {base.extraction_provider}")
+    print(f"{base.provider_key_name + ':':<19}{'set' if base.provider_key_set else 'NOT SET'}")
+    print(f"Model:             {base.provider_model}")
     print(f"Cache:             {'allowed (--use-cache)' if args.use_cache else 'off: live extraction'}")
     print(f"Confidence cutoff: {base.confidence_cutoff:.2f}")
 
@@ -83,7 +86,7 @@ def main(argv: list[str] | None = None) -> int:
                 ext = body["extraction"]
                 failures += ext["status"] != "ok"
                 print(f"extraction_source: {ext['extraction_source']}   status: {ext['status']}   "
-                      f"model: {ext['model']}   attempts: {ext['attempts']}")
+                      f"provider: {ext['provider']}   model: {ext['model']}   attempts: {ext['attempts']}")
                 if ext["error"]:
                     print(f"error: {ext['error']}")
                 for i, raw in enumerate(ext["raw_responses"], 1):
