@@ -1,0 +1,58 @@
+{
+  "case": "seed-reject-income",
+  "purpose": "Expected values for tests only. Never read by extraction and never sent to the model.",
+  "watermark": "SYNTHETIC - DEMO ONLY",
+  "expected_verdicts": {
+    "state_student_scholarship": "reject",
+    "income_based_fee_waiver": "reject"
+  },
+  "documents": [
+    {
+      "file": "identity_card.png",
+      "document_type": "identity_card",
+      "quality": "clean",
+      "expected": {
+        "name": "Meera Iyer",
+        "date_of_birth": "2005-11-02",
+        "state": "Tamil Nadu",
+        "id_last4": "7734"
+      },
+      "seed_confidence": {
+        "name": 0.97,
+        "date_of_birth": 0.96,
+        "state": 0.96,
+        "id_last4": 0.95
+      }
+    },
+    {
+      "file": "income_certificate.png",
+      "document_type": "income_certificate",
+      "quality": "clean",
+      "expected": {
+        "name": "Meera Iyer",
+        "state": "Tamil Nadu",
+        "annual_income_inr": 520000
+      },
+      "seed_confidence": {
+        "name": 0.95,
+        "state": 0.94,
+        "annual_income_inr": 0.95
+      }
+    },
+    {
+      "file": "marksheet.png",
+      "document_type": "marksheet",
+      "quality": "clean",
+      "expected": {
+        "name": "Meera Iyer",
+        "date_of_birth": "2005-11-02",
+        "marks_percent": 88.0
+      },
+      "seed_confidence": {
+        "name": 0.96,
+        "date_of_birth": 0.95,
+        "marks_percent": 0.97
+      }
+    }
+  ]
+}

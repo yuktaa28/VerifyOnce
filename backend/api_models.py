@@ -32,6 +32,7 @@ class SourceFactOut(BaseModel):
     value: Any
     confidence: float
     verification_status: str
+    problem: str | None = None
 
 
 class MismatchOut(BaseModel):

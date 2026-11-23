@@ -1,0 +1,58 @@
+{
+  "case": "seed-name-mismatch",
+  "purpose": "Expected values for tests only. Never read by extraction and never sent to the model.",
+  "watermark": "SYNTHETIC - DEMO ONLY",
+  "expected_verdicts": {
+    "state_student_scholarship": "needs_human_review",
+    "income_based_fee_waiver": "needs_human_review"
+  },
+  "documents": [
+    {
+      "file": "identity_card.png",
+      "document_type": "identity_card",
+      "quality": "clean",
+      "expected": {
+        "name": "Ishan Rao",
+        "date_of_birth": "2006-01-09",
+        "state": "Telangana",
+        "id_last4": "6612"
+      },
+      "seed_confidence": {
+        "name": 0.97,
+        "date_of_birth": 0.96,
+        "state": 0.95,
+        "id_last4": 0.95
+      }
+    },
+    {
+      "file": "income_certificate.png",
+      "document_type": "income_certificate",
+      "quality": "clean",
+      "expected": {
+        "name": "Ishan Rau",
+        "state": "Telangana",
+        "annual_income_inr": 260000
+      },
+      "seed_confidence": {
+        "name": 0.93,
+        "state": 0.93,
+        "annual_income_inr": 0.94
+      }
+    },
+    {
+      "file": "marksheet.png",
+      "document_type": "marksheet",
+      "quality": "clean",
+      "expected": {
+        "name": "Ishan Rao",
+        "date_of_birth": "2006-01-09",
+        "marks_percent": 72.0
+      },
+      "seed_confidence": {
+        "name": 0.95,
+        "date_of_birth": 0.95,
+        "marks_percent": 0.96
+      }
+    }
+  ]
+}

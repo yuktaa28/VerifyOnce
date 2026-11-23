@@ -1,0 +1,58 @@
+{
+  "case": "seed-below-marks",
+  "purpose": "Expected values for tests only. Never read by extraction and never sent to the model.",
+  "watermark": "SYNTHETIC - DEMO ONLY",
+  "expected_verdicts": {
+    "state_student_scholarship": "reject",
+    "income_based_fee_waiver": "approve"
+  },
+  "documents": [
+    {
+      "file": "identity_card.png",
+      "document_type": "identity_card",
+      "quality": "clean",
+      "expected": {
+        "name": "Arjun Mehta",
+        "date_of_birth": "2006-07-21",
+        "state": "Maharashtra",
+        "id_last4": "3390"
+      },
+      "seed_confidence": {
+        "name": 0.97,
+        "date_of_birth": 0.96,
+        "state": 0.95,
+        "id_last4": 0.96
+      }
+    },
+    {
+      "file": "income_certificate.png",
+      "document_type": "income_certificate",
+      "quality": "clean",
+      "expected": {
+        "name": "Arjun Mehta",
+        "state": "Maharashtra",
+        "annual_income_inr": 210000
+      },
+      "seed_confidence": {
+        "name": 0.94,
+        "state": 0.93,
+        "annual_income_inr": 0.94
+      }
+    },
+    {
+      "file": "marksheet.png",
+      "document_type": "marksheet",
+      "quality": "clean",
+      "expected": {
+        "name": "Arjun Mehta",
+        "date_of_birth": "2006-07-21",
+        "marks_percent": 52.0
+      },
+      "seed_confidence": {
+        "name": 0.96,
+        "date_of_birth": 0.95,
+        "marks_percent": 0.97
+      }
+    }
+  ]
+}

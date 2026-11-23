@@ -6,7 +6,7 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
@@ -15,6 +15,7 @@ from backend import service
 from backend.api_models import ApplicationRequest, DecisionOut
 from backend.config import Settings
 from backend.db import init_db, make_engine, make_session_factory
+from backend.extraction import DOCUMENT_SCHEMAS, MAX_IMAGE_BYTES, Extractor, image_media_type
 from backend.models import Application, AuditEvent, Document, Profile
 from backend.schemes import load_schemes
 
@@ -25,10 +26,17 @@ class UTF8JSONResponse(JSONResponse):
     media_type = "application/json; charset=utf-8"
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def _document_status(facts: list[dict[str, Any]], extraction_ok: bool) -> str:
+    if not extraction_ok:
+        return "extraction_failed"
+    return "flagged" if any(f["verification_status"] == "flagged" for f in facts) else "verified"
+
+
+def create_app(settings: Settings | None = None, *, extractor: Extractor | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     engine = make_engine(settings.database_url)
     schemes = load_schemes(settings.schemes_dir)
+    extractor = extractor or Extractor.from_settings(settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -47,6 +55,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = make_session_factory(engine)
     app.state.schemes = schemes
+    app.state.extractor = extractor
 
     def get_session(request: Request) -> Iterator[Session]:
         with request.app.state.session_factory() as session:
@@ -77,19 +86,62 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     "document_id": doc.id,
                     "document_type": doc.document_type,
                     "source": doc.source,
-                    "facts": [
-                        {
-                            "fact_id": f.id,
-                            "field": f.field,
-                            "value": f.value_json,
-                            "confidence": f.confidence,
-                            "verification_status": f.verification_status,
-                        }
-                        for f in doc.facts
-                    ],
+                    "filename": doc.filename,
+                    "extraction": {
+                        "status": doc.extraction_status,
+                        "source": doc.extraction_source,
+                        "model": doc.extraction_model,
+                        "error": doc.extraction_error,
+                    },
+                    "facts": [service.fact_payload(f) for f in doc.facts],
                 }
                 for doc in profile.documents
             ],
+        }
+
+    @app.post("/profiles/{profile_id}/documents", status_code=201)
+    def upload_document(
+        profile_id: str,
+        document_type: str = Form(...),
+        file: UploadFile = File(...),
+        session: Session = Depends(get_session),
+    ) -> dict[str, Any]:
+        """Upload one document image. Its fields are extracted, validated and cross-checked.
+
+        Creates the profile if it does not exist yet.
+        """
+        if document_type not in DOCUMENT_SCHEMAS:
+            raise HTTPException(422, f"document_type must be one of {sorted(DOCUMENT_SCHEMAS)}")
+        content = file.file.read(MAX_IMAGE_BYTES + 1)
+        try:
+            image_media_type(content)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+
+        document, result, changes = service.ingest_document(
+            session, app.state.extractor, profile_id, document_type, content,
+            filename=file.filename, actor=f"citizen:{profile_id}", confidence_cutoff=settings.confidence_cutoff,
+        )
+        session.commit()
+        facts = [service.fact_payload(f) for f in document.facts]
+        own_fact_ids = {f["fact_id"] for f in facts}
+        return {
+            "profile_id": profile_id,
+            "document_id": document.id,
+            "document_type": document_type,
+            "filename": document.filename,
+            "sha256": document.sha256,
+            "status": _document_status(facts, result.ok),
+            "extraction": {
+                "extraction_source": result.extraction_source,
+                "status": result.status,
+                "model": result.model,
+                "attempts": result.attempts,
+                "error": result.error,
+                "raw_responses": result.raw_responses,
+            },
+            "facts": facts,
+            "other_facts_changed": [c for c in changes if c["fact_id"] not in own_fact_ids],
         }
 
     @app.post("/profiles/{profile_id}/applications", status_code=201, response_model=DecisionOut)

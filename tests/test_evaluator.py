@@ -11,6 +11,7 @@ from backend.evaluator import (
     APPROVE,
     CONFLICT,
     FAIL,
+    INVALID,
     LOW_CONFIDENCE,
     MISSING,
     NEEDS_HUMAN_REVIEW,
@@ -26,8 +27,11 @@ SCHOLARSHIP = "state_student_scholarship"
 _ids = itertools.count(1)
 
 
-def obs(field, value, confidence=0.95, doc="identity_card", status="unverified"):
-    return Observation(field, value, confidence, fact_id=next(_ids), document_type=doc, verification_status=status)
+def obs(field, value, confidence=0.95, doc="identity_card", status="unverified", officer=False, problem=None):
+    return Observation(
+        field, value, confidence, fact_id=next(_ids), document_type=doc, verification_status=status,
+        officer_reviewed=officer, problem=problem,
+    )
 
 
 def profile(*, income=240_000, marks=78.5, income_conf=0.95, second_name="Ravi Patil", extra=()):
@@ -145,10 +149,39 @@ def test_high_confidence_copy_covers_a_low_confidence_one(schemes):
 
 def test_officer_verified_fact_counts_as_full_confidence(schemes):
     observations = [
-        o if o.field != "annual_income_inr" else obs("annual_income_inr", 240_000, 0.40, status="verified")
+        o if o.field != "annual_income_inr"
+        else obs("annual_income_inr", 240_000, 0.40, status="verified", officer=True)
         for o in profile()
     ]
     assert evaluate(schemes[SCHOLARSHIP], observations).verdict == APPROVE
+
+
+def test_automatic_verification_does_not_raise_confidence(schemes):
+    observations = [
+        o if o.field != "annual_income_inr" else obs("annual_income_inr", 240_000, 0.40, status="verified")
+        for o in profile()
+    ]
+    assert evaluate(schemes[SCHOLARSHIP], observations).verdict == NEEDS_HUMAN_REVIEW
+
+
+def test_unreadable_value_on_any_document_needs_review(schemes):
+    extra = (obs("name", None, 0.0, doc="marksheet", status="flagged", problem="No value could be read"),)
+    result = evaluate(schemes[SCHOLARSHIP], profile(extra=extra))
+    assert result.verdict == NEEDS_HUMAN_REVIEW
+    assert [(r.field, r.issue) for r in result.review_reasons] == [("name", INVALID)]
+    assert "name could not be used on the marksheet: no value could be read" in result.reason
+
+
+def test_field_with_only_invalid_values_is_unresolved(schemes):
+    observations = [
+        o if o.field != "marks_percent"
+        else obs("marks_percent", None, 0.9, doc="marksheet", problem="Marks percentage 105 is outside 0-100")
+        for o in profile()
+    ]
+    result = evaluate(schemes[SCHOLARSHIP], observations)
+    assert result.verdict == NEEDS_HUMAN_REVIEW
+    assert outcome(result, "minimum_marks").outcome == UNRESOLVED
+    assert "marks percentage 105 is outside 0-100" in result.reason
 
 
 def test_officer_rejected_fact_is_ignored(schemes):

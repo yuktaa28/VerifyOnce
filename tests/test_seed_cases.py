@@ -84,8 +84,8 @@ def test_name_mismatch_reports_both_spellings(seeded_client):
     (mismatch,) = body["mismatches"]
     assert mismatch["field"] == "name"
     groups = {g["value"]: [o["document_type"] for o in g["observations"]] for g in mismatch["groups"]}
-    assert groups == {"Ishan Rao": ["identity_card", "income_certificate"], "Ishan Rau": ["marksheet"]}
-    assert "'Ishan Rao' (identity card, income certificate) vs 'Ishan Rau' (marksheet)" in body["reason"]
+    assert groups == {"Ishan Rao": ["identity_card", "marksheet"], "Ishan Rau": ["income_certificate"]}
+    assert "'Ishan Rao' (identity card, marksheet) vs 'Ishan Rau' (income certificate)" in body["reason"]
     # The eligibility rules themselves still pass and are recorded.
     assert {o["outcome"] for o in body["rule_outcomes"]} == {"pass"}
 
@@ -94,8 +94,30 @@ def test_low_confidence_names_the_field_and_score(seeded_client):
     body = submit(seeded_client, "seed-low-confidence", SCHOLARSHIP)
     assert body["verdict"] == "needs_human_review"
     (reason,) = body["review_reasons"]
-    assert (reason["field"], reason["issue"]) == ("annual_income_inr", "low_confidence")
+    assert (reason["field"], reason["issue"]) == ("marks_percent", "low_confidence")
     assert "62%, below the 80% cutoff" in body["reason"]
+    # The blurry marksheet's name agrees with the confident copies, so it does not block,
+    # and the fee waiver (no marks rule) is offered instead.
+    assert [s["scheme_id"] for s in body["possible_schemes"]] == [FEE_WAIVER]
+
+
+def test_seed_facts_move_to_verified_or_flagged(seeded_client):
+    statuses = {}
+    for seed in SEED_PROFILES:
+        profile = seeded_client.get(f"/profiles/{seed.id}").json()
+        for doc in profile["documents"]:
+            for fact in doc["facts"]:
+                statuses[(seed.id, doc["document_type"], fact["field"])] = fact["verification_status"]
+    assert "unverified" not in statuses.values()
+    flagged = sorted(k for k, v in statuses.items() if v == "flagged")
+    assert flagged == [
+        ("seed-low-confidence", "marksheet", "date_of_birth"),
+        ("seed-low-confidence", "marksheet", "marks_percent"),
+        ("seed-low-confidence", "marksheet", "name"),
+        ("seed-name-mismatch", "identity_card", "name"),
+        ("seed-name-mismatch", "income_certificate", "name"),
+        ("seed-name-mismatch", "marksheet", "name"),
+    ]
 
 
 def test_seeding_is_reproducible_and_idempotent(seeded_client, db_session):

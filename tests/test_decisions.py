@@ -84,13 +84,14 @@ def test_resubmission_appends_a_new_decision(seeded_client, db_session):
 
 
 def test_correction_then_resubmission_keeps_the_old_decision(seeded_client, db_session):
-    """An officer verifies the blurry income figure; the new decision approves, the old one stays."""
+    """An officer verifies the blurry marks figure; the new decision approves, the old one stays."""
     first = submit(seeded_client, "seed-low-confidence")
     assert first["verdict"] == "needs_human_review"
 
-    income_fact_id = first["review_reasons"][0]["fact_ids"][0]
-    fact = db_session.get(Fact, income_fact_id)
-    set_fact_status(db_session, fact, "verified", actor="officer:demo", note="Checked the original certificate")
+    marks_fact_id = first["review_reasons"][0]["fact_ids"][0]
+    fact = db_session.get(Fact, marks_fact_id)
+    assert (fact.field, fact.verification_status) == ("marks_percent", "flagged")
+    set_fact_status(db_session, fact, "verified", actor="officer:demo", note="Checked the original marksheet")
     db_session.commit()
 
     second = submit(seeded_client, "seed-low-confidence")
@@ -99,12 +100,15 @@ def test_correction_then_resubmission_keeps_the_old_decision(seeded_client, db_s
     db_session.expire_all()
     assert db_session.get(Decision, first["decision_id"]).verdict == "needs_human_review"
 
-    events = db_session.scalars(select(AuditEvent).where(AuditEvent.fact_id == income_fact_id)).all()
-    assert [e.action for e in events] == ["fact.observed", "fact.status_changed"]
-    assert [e.action for e in db_session.get(Fact, income_fact_id).history] == [
-        "fact.observed",
-        "fact.status_changed",
+    events = db_session.scalars(select(AuditEvent).where(AuditEvent.fact_id == marks_fact_id)).all()
+    # observed -> flagged by the automatic checks -> verified by the officer
+    assert [(e.action, e.actor) for e in events] == [
+        ("fact.observed", "seed"),
+        ("fact.status_changed", "seed"),
+        ("fact.status_changed", "officer:demo"),
     ]
+    assert [e.details.get("to") for e in events[1:]] == ["flagged", "verified"]
+    assert [e.id for e in db_session.get(Fact, marks_fact_id).history] == [e.id for e in events]
 
 
 def test_unknown_profile_and_scheme_are_refused(seeded_client):

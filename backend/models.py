@@ -6,8 +6,12 @@
 * Decisions and audit events are append-only. The ORM refuses to update or delete
   them, and on SQLite a trigger refuses it at the database level too. A correction
   or resubmission adds a new Decision that points at the one it supersedes.
-* ``id_last4`` facts must be exactly four digits. Full ID numbers never reach the
-  database.
+* ``id_last4`` facts must be exactly four digits (or empty when unreadable). Full ID
+  numbers never reach the database.
+* A fact's ``verification_status`` starts as ``unverified``. Deterministic checks
+  (``backend.verification``) move it to ``verified`` or ``flagged``. An officer may
+  set ``verified`` or ``rejected``; ``reviewed_by`` records who, and automatic checks
+  never overwrite an officer's decision.
 """
 
 from __future__ import annotations
@@ -33,7 +37,7 @@ from sqlalchemy.orm import Mapped, mapped_column, object_session, relationship
 from backend.db import Base
 from backend.fields import FIELD_TYPES, from_json_value
 
-VERIFICATION_STATUSES = ("unverified", "verified", "rejected")
+VERIFICATION_STATUSES = ("unverified", "verified", "flagged", "rejected")
 
 
 def utcnow() -> datetime:
@@ -66,6 +70,10 @@ class Document(Base):
     filename: Mapped[str | None] = mapped_column(String(255))
     sha256: Mapped[str | None] = mapped_column(String(64))
     source: Mapped[str] = mapped_column(String(20), default="upload")
+    extraction_status: Mapped[str | None] = mapped_column(String(20))  # ok / failed; None for seeds
+    extraction_source: Mapped[str | None] = mapped_column(String(10))  # live / cache
+    extraction_model: Mapped[str | None] = mapped_column(String(100))
+    extraction_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     profile: Mapped[Profile] = relationship(back_populates="documents")
@@ -80,9 +88,11 @@ class Fact(Base):
     document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), index=True)
     field: Mapped[str] = mapped_column(String(50))
     value_type: Mapped[str] = mapped_column(String(10))
-    value_json: Mapped[Any] = mapped_column(JSON)
+    value_json: Mapped[Any] = mapped_column(JSON, nullable=True)  # None: unreadable or failed validation
     confidence: Mapped[float] = mapped_column(Float)
     verification_status: Mapped[str] = mapped_column(String(20), default="unverified")
+    checks: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    reviewed_by: Mapped[str | None] = mapped_column(String(100))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
 
@@ -92,6 +102,12 @@ class Fact(Base):
     @property
     def value(self) -> Any:
         return from_json_value(self.field, self.value_json)
+
+    @property
+    def problem(self) -> str | None:
+        """Why the value is unusable (first failed validator), or None."""
+        failed = [c for c in self.checks or [] if c.get("kind") == "validator" and not c.get("passed")]
+        return failed[0]["message"] if failed else None
 
 
 class Application(Base):
@@ -154,7 +170,7 @@ class AuditEvent(Base):
 def _check_fact(_mapper, _connection, fact: Fact) -> None:
     if fact.field not in FIELD_TYPES:
         raise ValueError(f"Unknown fact field {fact.field!r}")
-    if fact.field == "id_last4" and not re.fullmatch(r"\d{4}", str(fact.value_json)):
+    if fact.field == "id_last4" and fact.value_json is not None and not re.fullmatch(r"\d{4}", str(fact.value_json)):
         raise ValueError("id_last4 must be exactly 4 digits; full ID numbers are never stored")
     if not 0.0 <= fact.confidence <= 1.0:
         raise ValueError("confidence must be between 0 and 1")

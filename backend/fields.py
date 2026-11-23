@@ -68,7 +68,7 @@ def coerce_value(field: str, raw: Any) -> Any:
         if kind == "float":
             return _to_percent(field, raw)
         if kind == "date":
-            return _to_date(raw)
+            return parse_date(raw)
     except (TypeError, ValueError) as exc:
         if isinstance(exc, FieldValueError):
             raise
@@ -102,12 +102,18 @@ def _to_percent(field: str, raw: Any) -> float:
     return value
 
 
-def _to_date(raw: Any) -> date:
+def parse_date(raw: Any) -> date:
+    """ISO dates (2006-07-21) or Indian day-first dates (21/07/2006, 21-07-2006, 21.07.2006)."""
     if isinstance(raw, datetime):
         return raw.date()
     if isinstance(raw, date):
         return raw
-    return date.fromisoformat(str(raw).strip())
+    text = str(raw).strip()
+    day_first = re.fullmatch(r"(\d{1,2})[/.-](\d{1,2})[/.-](\d{4})", text)
+    if day_first:
+        day, month, year = (int(part) for part in day_first.groups())
+        return date(year, month, day)
+    return date.fromisoformat(text)
 
 
 def to_json_value(field: str, value: Any) -> Any:

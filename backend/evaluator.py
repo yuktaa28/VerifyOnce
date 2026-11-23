@@ -2,8 +2,9 @@
 
 Verdict precedence (the first matching step wins):
 
-1. ``needs_human_review``: evidence for a field the scheme needs is missing, below the
-   confidence cutoff (default 0.80), or conflicts across documents.
+1. ``needs_human_review``: evidence for a field the scheme needs is missing,
+   unreadable or invalid on some document, below the confidence cutoff (default
+   0.80), or conflicts across documents.
 2. ``reject``: the evidence is reliable and at least one eligibility rule fails.
 3. ``approve``: the evidence is reliable and every rule passes.
 
@@ -15,12 +16,16 @@ unresolved), even when the verdict is review.
 Evidence rules, per field:
 
 * Observations an officer marked ``rejected`` are ignored.
-* An observation an officer marked ``verified`` counts as confidence 1.0.
-* The field is low-confidence when its best observation is below the cutoff. A value
-  exactly at the cutoff is accepted.
-* The field conflicts when any two observations disagree (names use
+* An observation an officer marked ``verified`` counts as confidence 1.0. (Automatic
+  verification does not change confidence.)
+* An observation with no value (unreadable, or it failed a validator) makes the field
+  ``invalid``: the document cannot be checked against the others.
+* The field is low-confidence when its best readable observation is below the cutoff.
+  A value exactly at the cutoff is accepted, and a low-confidence reading that agrees
+  with a confident one is covered by it.
+* The field conflicts when any two readable observations disagree (names use
   ``backend.names.names_match``; other text ignores case and spacing).
-* The value used is the observation with the highest confidence.
+* The value used is the readable observation with the highest confidence.
 """
 
 from __future__ import annotations
@@ -44,6 +49,7 @@ FAIL = "fail"
 UNRESOLVED = "unresolved"
 
 MISSING = "missing"
+INVALID = "invalid"
 LOW_CONFIDENCE = "low_confidence"
 CONFLICT = "conflict"
 
@@ -59,10 +65,14 @@ class Observation:
     document_id: int | None = None
     document_type: str | None = None
     verification_status: str = "unverified"
+    officer_reviewed: bool = False
+    problem: str | None = None  # why value is None (unreadable / failed validator)
 
     @property
     def effective_confidence(self) -> float:
-        return 1.0 if self.verification_status == "verified" else self.confidence
+        if self.verification_status == "verified" and self.officer_reviewed:
+            return 1.0
+        return self.confidence
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -73,6 +83,7 @@ class Observation:
             "value": to_json_value(self.field, self.value),
             "confidence": self.confidence,
             "verification_status": self.verification_status,
+            "problem": self.problem,
         }
 
 
@@ -85,8 +96,17 @@ class FieldEvidence:
     groups: list[list[Observation]] = dc_field(default_factory=list)
 
     @property
+    def readable(self) -> list[Observation]:
+        return [o for o in self.observations if o.value is not None]
+
+    @property
+    def unreadable(self) -> list[Observation]:
+        return [o for o in self.observations if o.value is None]
+
+    @property
     def best_confidence(self) -> float | None:
-        return self.observations[0].effective_confidence if self.observations else None
+        readable = self.readable
+        return readable[0].effective_confidence if readable else None
 
     @property
     def fact_ids(self) -> list[int]:
@@ -147,17 +167,22 @@ def values_agree(field_name: str, a: Any, b: Any) -> bool:
 
 
 def resolve_field(field_name: str, observations: list[Observation], cutoff: float) -> FieldEvidence:
-    """Collect one field's observations and flag missing, low-confidence or conflicting evidence."""
+    """Collect one field's observations and flag missing, invalid, low-confidence or conflicting evidence."""
     usable = [o for o in observations if o.field == field_name and o.verification_status != "rejected"]
     usable.sort(key=lambda o: (-o.effective_confidence, o.fact_id or 0))
     evidence = FieldEvidence(field=field_name, observations=usable)
     if not usable:
         evidence.issues.append(MISSING)
         return evidence
+    if evidence.unreadable:
+        evidence.issues.append(INVALID)
 
-    evidence.value = usable[0].value
+    readable = evidence.readable
+    if not readable:
+        return evidence
+    evidence.value = readable[0].value
     # Group observations that all agree with each other; more than one group is a conflict.
-    for obs in usable:
+    for obs in readable:
         for group in evidence.groups:
             if all(values_agree(field_name, obs.value, other.value) for other in group):
                 group.append(obs)
@@ -166,7 +191,7 @@ def resolve_field(field_name: str, observations: list[Observation], cutoff: floa
             evidence.groups.append([obs])
     if len(evidence.groups) > 1:
         evidence.issues.append(CONFLICT)
-    if usable[0].effective_confidence < cutoff:
+    if readable[0].effective_confidence < cutoff:
         evidence.issues.append(LOW_CONFIDENCE)
     return evidence
 
@@ -230,14 +255,14 @@ def _evaluate_rule(rule: Rule, ev: FieldEvidence, cutoff: float) -> RuleOutcome:
     issues = list(ev.issues)
 
     if rule.op == "exists":
-        present = bool(ev.observations)
+        present = bool(ev.readable)
         outcome = PASS if present else FAIL
         return RuleOutcome(
             rule.id, rule.field, rule.op, None, present, outcome, [], ev.fact_ids,
             _rule_message(rule, outcome, None),
         )
 
-    if MISSING in ev.issues:
+    if not ev.readable:
         outcome = UNRESOLVED
     elif CONFLICT in ev.issues:
         # Conflicting values only leave the rule unresolved if they would decide it differently.
@@ -306,8 +331,14 @@ def _issue_message(ev: FieldEvidence, issue: str, cutoff: float) -> str:
     label = field_label(ev.field)
     if issue == MISSING:
         return f"{label} is missing from the documents"
+    if issue == INVALID:
+        parts = [
+            f"on the {document_label(o.document_type)}: {_lower_first(o.problem or 'No value could be read')}"
+            for o in ev.unreadable
+        ]
+        return f"{label} could not be used " + "; ".join(parts)
     if issue == LOW_CONFIDENCE:
-        best = ev.observations[0]
+        best = ev.readable[0]
         return (
             f"{label} was read with low confidence ({best.effective_confidence:.0%}, below the "
             f"{cutoff:.0%} cutoff) from the {document_label(best.document_type)}"

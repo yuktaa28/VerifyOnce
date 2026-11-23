@@ -6,13 +6,15 @@ submission adds a new Decision, linked to the one it supersedes.
 
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
 from backend.evaluator import APPROVE, NEEDS_HUMAN_REVIEW, Observation, evaluate
-from backend.fields import FIELD_TYPES, coerce_value, to_json_value
+from backend.extraction import DOCUMENT_FIELDS, ExtractionResult, Extractor
+from backend.fields import FIELD_TYPES, to_json_value
 from backend.models import (
     VERIFICATION_STATUSES,
     Application,
@@ -23,6 +25,7 @@ from backend.models import (
     Profile,
 )
 from backend.schemes import Scheme
+from backend.verification import validate, verify_profile
 
 
 class ProfileNotFound(LookupError):
@@ -52,8 +55,20 @@ def add_document(
     actor: str,
     filename: str | None = None,
     source: str = "upload",
+    sha256: str | None = None,
+    extraction: ExtractionResult | None = None,
 ) -> Document:
-    document = Document(profile=profile, document_type=document_type, filename=filename, source=source)
+    document = Document(
+        profile=profile,
+        document_type=document_type,
+        filename=filename,
+        source=source,
+        sha256=sha256,
+        extraction_status=extraction.status if extraction else None,
+        extraction_source=extraction.extraction_source if extraction else None,
+        extraction_model=extraction.model if extraction else None,
+        extraction_error=extraction.error if extraction else None,
+    )
     session.add(document)
     session.flush()
     session.add(
@@ -75,17 +90,22 @@ def add_fact(
     confidence: float,
     *,
     actor: str,
-    verification_status: str = "unverified",
 ) -> Fact:
-    """Record one observation. The raw value is typed (and ID numbers masked) before storage."""
-    value = coerce_value(field, raw_value)
+    """Record one observation, unverified, after running the field's validators.
+
+    The stored value is typed and ID numbers are cut to their last 4 digits. If the raw
+    value is unreadable or fails a validator, the stored value is empty and the failed
+    check says why. ``verify_profile`` then sets the status.
+    """
+    value, checks = validate(field, raw_value)
     fact = Fact(
         document=document,
         field=field,
         value_type=FIELD_TYPES[field],
-        value_json=to_json_value(field, value),
+        value_json=to_json_value(field, value) if value is not None else None,
         confidence=confidence,
-        verification_status=verification_status,
+        verification_status="unverified",
+        checks=[c.as_dict() for c in checks],
     )
     session.add(fact)
     session.flush()
@@ -95,20 +115,58 @@ def add_fact(
             action="fact.observed",
             profile_id=document.profile_id,
             fact_id=fact.id,
-            details={"field": field, "document_id": document.id, "confidence": confidence},
+            details={"field": field, "document_id": document.id, "confidence": confidence,
+                     "readable": value is not None},
         )
     )
     return fact
 
 
+def ingest_document(
+    session: Session,
+    extractor: Extractor,
+    profile_id: str,
+    document_type: str,
+    content: bytes,
+    *,
+    filename: str | None,
+    actor: str,
+    confidence_cutoff: float,
+) -> tuple[Document, ExtractionResult, list[dict[str, Any]]]:
+    """Extract one uploaded document, store its facts, and re-verify the whole profile.
+
+    A failed extraction still stores one empty fact per field, so every field is
+    flagged and the profile goes to an officer instead of silently missing data.
+    """
+    profile = session.get(Profile, profile_id)
+    if profile is None:
+        profile = create_profile(session, profile_id, actor=actor)
+    result = extractor.extract(content, document_type)
+    document = add_document(
+        session, profile, document_type, actor=actor, filename=filename, source="upload",
+        sha256=hashlib.sha256(content).hexdigest(), extraction=result,
+    )
+    for field in DOCUMENT_FIELDS[document_type]:
+        reading = result.readings.get(field) if result.ok else None
+        add_fact(
+            session, document, field,
+            reading["value"] if reading else None,
+            float(reading["confidence"]) if reading else 0.0,
+            actor=f"extractor:{result.extraction_source}",
+        )
+    changes = verify_profile(session, profile_id, confidence_cutoff=confidence_cutoff)
+    return document, result, changes
+
+
 def set_fact_status(
     session: Session, fact: Fact, status: str, *, actor: str, note: str | None = None
 ) -> AuditEvent:
-    """Mark a fact verified or rejected (or back to unverified) and record why."""
+    """An officer marks a fact verified or rejected. Automatic checks will not override it."""
     if status not in VERIFICATION_STATUSES:
         raise ValueError(f"status must be one of {VERIFICATION_STATUSES}")
     previous = fact.verification_status
     fact.verification_status = status
+    fact.reviewed_by = actor
     event = AuditEvent(
         actor=actor,
         action="fact.status_changed",
@@ -138,9 +196,24 @@ def profile_observations(session: Session, profile_id: str) -> list[Observation]
             document_id=f.document_id,
             document_type=f.document.document_type,
             verification_status=f.verification_status,
+            officer_reviewed=f.reviewed_by is not None,
+            problem=f.problem,
         )
         for f in facts
     ]
+
+
+def fact_payload(fact: Fact) -> dict[str, Any]:
+    return {
+        "fact_id": fact.id,
+        "document_id": fact.document_id,
+        "field": fact.field,
+        "value": fact.value_json,
+        "confidence": fact.confidence,
+        "verification_status": fact.verification_status,
+        "reviewed_by": fact.reviewed_by,
+        "checks": fact.checks,
+    }
 
 
 # --- Applications and decisions -------------------------------------------------------
