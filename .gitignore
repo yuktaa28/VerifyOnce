@@ -1,0 +1,14 @@
+# Python
+.venv/
+__pycache__/
+.pytest_cache/
+
+# Secrets
+.env
+
+# Databases
+*.db
+*.sqlite3
+
+# Extraction cache
+data/cache/

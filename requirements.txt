@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+pyyaml
+pytest
+httpx
+python-multipart
+pillow
+streamlit
+anthropic
