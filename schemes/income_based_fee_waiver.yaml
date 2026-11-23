@@ -1,0 +1,21 @@
+# Fictional scheme for the VerifyOnce demo. Thresholds live here, never in code.
+# The file name must match the scheme id.
+id: income_based_fee_waiver
+name: Income-Based Fee Waiver
+ruleset_version: "2026.1"
+description: >-
+  Tuition fee waiver for students from families with an annual income of at
+  most 450000 INR. There is no marks requirement.
+
+# Identity evidence that must be present, confident and consistent across
+# documents before any eligibility rule can decide the application.
+required_fields:
+  - name
+  - id_last4
+
+rules:
+  - id: income_limit
+    field: annual_income_inr
+    op: lte
+    value: 450000
+    description: Annual family income must be at most 450000 INR.

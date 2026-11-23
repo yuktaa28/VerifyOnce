@@ -1,0 +1,40 @@
+"""SQLAlchemy engine, session factory and table creation."""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def _enable_sqlite_foreign_keys(dbapi_connection, _record) -> None:
+    cursor = dbapi_connection.cursor()
+    cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.close()
+
+
+def make_engine(url: str) -> Engine:
+    is_sqlite = url.startswith("sqlite")
+    engine = create_engine(url, connect_args={"check_same_thread": False} if is_sqlite else {})
+    if is_sqlite:
+        event.listen(engine, "connect", _enable_sqlite_foreign_keys)
+    return engine
+
+
+def make_session_factory(engine: Engine) -> sessionmaker[Session]:
+    return sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def init_db(engine: Engine) -> None:
+    """Create tables (and SQLite immutability triggers) if they do not exist yet."""
+    database = engine.url.database
+    if engine.url.get_backend_name() == "sqlite" and database and database != ":memory:":
+        Path(database).parent.mkdir(parents=True, exist_ok=True)
+    from backend import models  # noqa: F401  (registers the tables on Base.metadata)
+
+    Base.metadata.create_all(engine)

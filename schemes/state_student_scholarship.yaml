@@ -1,0 +1,27 @@
+# Fictional scheme for the VerifyOnce demo. Thresholds live here, never in code.
+# The file name must match the scheme id.
+id: state_student_scholarship
+name: State Student Scholarship
+ruleset_version: "2026.1"
+description: >-
+  Annual scholarship for students from lower-income families who scored at
+  least 60% in their last qualifying exam.
+
+# Identity evidence that must be present, confident and consistent across
+# documents before any eligibility rule can decide the application.
+required_fields:
+  - name
+  - id_last4
+
+rules:
+  - id: income_limit
+    field: annual_income_inr
+    op: lte
+    value: 300000
+    description: Annual family income must be at most 300000 INR.
+
+  - id: minimum_marks
+    field: marks_percent
+    op: gte
+    value: 60
+    description: Marks in the last qualifying exam must be at least 60%.
