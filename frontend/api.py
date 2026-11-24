@@ -8,6 +8,7 @@ one value is read), defaulting to http://127.0.0.1:8000.
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +49,11 @@ def _http() -> httpx.Client:
 
 def _request(method: str, path: str, **kwargs: Any) -> Any:
     try:
-        response = _http().request(method, path, **kwargs)
+        try:
+            response = _http().request(method, path, **kwargs)
+        except httpx.ConnectError:
+            time.sleep(0.5)  # one quick retry: the API may still be starting
+            response = _http().request(method, path, **kwargs)
     except httpx.HTTPError as exc:
         raise ApiError(None, f"Cannot reach the API at {base_url()} ({type(exc).__name__})") from None
     if response.status_code >= 400:

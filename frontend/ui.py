@@ -136,6 +136,12 @@ def show_verdict(verdict: str, reason: str) -> None:
 # --- Tables -------------------------------------------------------------------------------
 
 
+def wrapped_table(rows: list[dict]) -> None:
+    """A static table whose cells wrap, so long reasons are never cut off."""
+    if rows:
+        st.table(rows, hide_index=True)
+
+
 def facts_table(facts: list[dict], *, show_document: bool = False) -> None:
     rows = []
     for fact in facts:
@@ -150,7 +156,7 @@ def facts_table(facts: list[dict], *, show_document: bool = False) -> None:
         if show_document:
             row = {"Document": document_label(fact.get("document_type")), **row}
         rows.append(row)
-    st.dataframe(rows, hide_index=True, width="stretch")
+    wrapped_table(rows)
 
 
 def rule_table(outcomes: list[dict]) -> None:
@@ -164,7 +170,7 @@ def rule_table(outcomes: list[dict]) -> None:
         }
         for o in outcomes
     ]
-    st.dataframe(rows, hide_index=True, width="stretch")
+    wrapped_table(rows)
 
 
 def image_quality_line(quality: dict | None) -> str:

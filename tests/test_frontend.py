@@ -55,12 +55,29 @@ def test_each_page_loads(ui_client, page):
     assert not at.error, [e.value for e in at.error]
 
 
+def tables_of(at: AppTest) -> list:
+    return [t.value for t in at.table]
+
+
 def test_profile_page_masks_ids_and_shows_source_badges(ui_client):
     at = run_page("pages/citizen_profile.py", profile_id="seed-approve")
-    tables = [df.value for df in at.dataframe]
+    tables = tables_of(at)
     values = {v for table in tables for v in table["Value"]}
     assert "XXXX XXXX 2051" in values and "2051" not in values
     assert {s for table in tables for s in table["Source"]} == {"seed fixture · no model"}
+
+
+def test_long_flag_reasons_are_shown_in_full(ui_client):
+    """Facts tables wrap text (st.table), so long reasons are not cut off."""
+    at = run_page("pages/citizen_profile.py", profile_id="seed-low-confidence")
+    reasons = [r for table in tables_of(at) for r in table["Why flagged"]]
+    assert ("Image is blurry or low-contrast, so an officer must check it; "
+            "Confidence 0.62 is below the 0.85 cutoff") in reasons
+    assert not at.dataframe  # nothing rendered in a truncating grid
+
+    at = run_page("pages/citizen_profile.py", profile_id="seed-name-mismatch")
+    reasons = [r for table in tables_of(at) for r in table["Why flagged"]]
+    assert "Name differs from 'Ishan Rao' on the identity card, 'Ishan Rao' on the marksheet" in reasons
 
 
 def test_schemes_page_shows_reuse_offer_after_rejection(ui_client):
@@ -86,6 +103,29 @@ def test_case_page_blocks_approval_with_unresolved_flags(ui_client):
     assert "Approval is blocked" in text_of(at)
     shown = {m.label: m.value for m in at.metric}  # the two spellings, side by side
     assert shown == {"Identity card, Marksheet": "Ishan Rao", "Income certificate": "Ishan Rau"}
+    assert "awaiting officer decision" in text_of(at)
+
+
+def test_case_page_shows_a_suggestion_not_a_decision_after_resolution(ui_client):
+    application = ui_client.post("/profiles/seed-name-mismatch/applications",
+                                 json={"scheme_id": "state_student_scholarship"}).json()
+    case_id = application["application_id"]
+    rau = next(f for f in ui_client.get(f"/officer/cases/{case_id}").json()["unresolved_flags"]
+               if f["value"] == "Ishan Rau")
+    ui_client.post(f"/officer/cases/{case_id}/evidence", json={
+        "fact_id": rau["fact_id"], "resolution": "reject", "reason": "Typo on the certificate", "officer": "Asha"})
+    at = run_page("pages/officer_case.py", case_id=case_id)
+    text = text_of(at)
+    assert "Suggested: ✅ Approved" in text
+    assert "awaiting officer decision" in text and "Decision on record" in text
+    assert not next(b for b in at.button if b.label == "Approve").disabled
+    audit = [row for table in tables_of(at) if "What happened" in table for row in table["What happened"]]
+    assert ("Evidence rejected: Name on the income certificate. Suggested verdict now: approve. "
+            "Still awaiting officer decision.") in audit
+
+    queue = run_page("pages/officer_queue.py")
+    row = next(r for t in tables_of(queue) if "Status" in t for r in t.to_dict("records") if r["Case"] == case_id)
+    assert (row["Status"], row["Suggested now"]) == ("⏳ awaiting officer decision", "✅ Approved")
 
 
 def test_pages_say_when_the_api_is_down(monkeypatch):

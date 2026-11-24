@@ -131,7 +131,8 @@ def test_confidence_below_cutoff_needs_review(schemes):
     result = evaluate(schemes[SCHOLARSHIP], profile(income_conf=0.79))
     assert result.verdict == NEEDS_HUMAN_REVIEW
     assert [(r.field, r.issue) for r in result.review_reasons] == [("annual_income_inr", LOW_CONFIDENCE)]
-    assert "79%, below the 85% cutoff" in result.reason
+    assert ("annual income was read from the income certificate with confidence 79%, below the 85% cutoff"
+            in result.reason)
 
 
 def test_default_cutoff_rejects_a_coarse_point_eight(schemes):

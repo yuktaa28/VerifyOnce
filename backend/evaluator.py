@@ -368,8 +368,8 @@ def _issue_message(ev: FieldEvidence, issue: str, cutoff: float) -> str:
     if issue == LOW_CONFIDENCE:
         best = ev.best
         return (
-            f"{label} was read with low confidence ({best.effective_confidence:.0%}, below the "
-            f"{cutoff:.0%} cutoff) from the {document_label(best.document_type)}"
+            f"{label} was read from the {document_label(best.document_type)} with confidence "
+            f"{best.effective_confidence:.0%}, below the {cutoff:.0%} cutoff"
         )
     parts = []
     for group in ev.groups:

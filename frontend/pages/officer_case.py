@@ -37,12 +37,19 @@ def done(message: str) -> None:
 
 st.subheader(f"Case {detail['application_id']}: {detail['profile_id']} · {detail['scheme']['name']}")
 st.caption(detail["profile_label"] or "")
-ui.show_verdict(decision["verdict"], decision["reason"])
-st.caption(f"Decision #{decision['sequence']} (id {decision['decision_id']}) · decided by {decision['decided_by']} · "
-           f"ruleset {decision['ruleset_version']}")
 current = detail["current_evaluation"]
-if current["verdict"] != decision["verdict"]:
-    st.caption(f"On the current evidence the evaluator would say: {ui.verdict_label(current['verdict'])}.")
+if detail["awaiting_officer_decision"]:
+    st.info("**Status: awaiting officer decision.** This case closes only when an officer approves, "
+            "rejects, or overrides with a typed reason.")
+    with st.container(border=True):
+        st.markdown(f"**Suggested: {ui.verdict_label(detail['suggested_verdict'])}**  \n{current['reason']}")
+        st.caption("Re-evaluated on the current evidence. A suggestion only, not a decision.")
+    st.markdown("**Decision on record**")
+else:
+    st.markdown(f"**Status: {detail['status']}**")
+ui.show_verdict(decision["verdict"], decision["reason"])
+st.caption(f"Decision {decision['sequence']} on this application (id {decision['decision_id']}) · decided by "
+           f"{decision['decided_by']} · ruleset {decision['ruleset_version']}")
 
 st.markdown("#### Rule outcomes")
 ui.rule_table(decision["rule_outcomes"])
@@ -102,9 +109,10 @@ for fact in detail["unresolved_flags"]:
             reason = st.text_input("Reason (required)", key=f"reason-{fact['fact_id']}")
             if st.form_submit_button("Record resolution"):
                 try:
-                    api.resolve_evidence(case_id, fact["fact_id"], resolution, reason, officer)
+                    result = api.resolve_evidence(case_id, fact["fact_id"], resolution, reason, officer)
                     done(f"{ui.field_label(fact['field'])} on the {ui.document_label(fact['document_type'])} "
-                         f"{'confirmed' if resolution == 'confirm' else 'rejected'}. The case was re-evaluated.")
+                         f"{'confirmed' if resolution == 'confirm' else 'rejected'}. Suggested verdict now: "
+                         f"{ui.verdict_label(result['suggested_verdict'])}. The case still needs your decision.")
                 except api.ApiError as exc:
                     st.error(exc.message)
 
@@ -157,19 +165,14 @@ with override_col, st.form("override"):
 
 st.markdown("#### Audit history")
 history = ui.call(api.audit, case_id)
-st.dataframe(
-    [
-        {
-            "When (UTC)": str(e["at"])[:19].replace("T", " "),
-            "Actor": e["actor"],
-            "Action": e["action"] + (" (original decision)" if e["is_original_decision"] else ""),
-            "Decision #": e["decision_sequence"],
-            "Verdict": ui.verdict_label(e["verdict"]) if e["verdict"] else "—",
-            "Reason": e["reason"] or "—",
-        }
-        for e in history["events"]
-    ],
-    hide_index=True,
-    width="stretch",
-)
+ui.wrapped_table([
+    {
+        "When (UTC)": str(e["at"])[:19].replace("T", " "),
+        "Actor": e["actor"],
+        "What happened": e["summary"],
+        "Decision": e["decision_sequence"] or "—",
+        "Reason": e["reason"] or "—",
+    }
+    for e in history["events"]
+])
 st.caption("Decisions are superseded, never edited. Every row above is permanent.")

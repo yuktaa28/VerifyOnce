@@ -39,7 +39,7 @@ class UnknownScheme(LookupError):
 
 
 class AlreadyDecided(RuntimeError):
-    """An officer has decided this application; a citizen resubmission must not overwrite it."""
+    """An officer has decided this application, or must: a citizen resubmission may not replace it."""
 
 
 # --- Profiles, documents, facts -------------------------------------------------------
@@ -278,9 +278,14 @@ def submit_application(
         )
 
     previous = latest_decision(session, application.id)
-    if previous is not None and is_officer_decision(previous):
+    status = application_status(previous) if previous else None
+    if status == DECIDED_BY_OFFICER:
         raise AlreadyDecided(
             f"{scheme.name} was decided by an officer ({previous.verdict}); ask the office to reopen it"
+        )
+    if status == AWAITING_OFFICER:
+        raise AlreadyDecided(
+            f"{scheme.name} is awaiting an officer decision. Documents you upload are included in their review."
         )
     result = evaluate(scheme, profile_observations(session, profile_id), confidence_cutoff)
     return record_decision(
@@ -290,8 +295,26 @@ def submit_application(
     )
 
 
+AWAITING_OFFICER = "awaiting officer decision"
+DECIDED_BY_OFFICER = "decided by officer"
+DECIDED_AUTOMATICALLY = "decided automatically"
+
+
 def is_officer_decision(decision: Decision) -> bool:
     return decision.decided_by.startswith("officer:")
+
+
+def application_status(latest: Decision) -> str:
+    """Where an application stands, from its latest decision.
+
+    A needs_human_review decision stays "awaiting officer decision" until an officer
+    records approve, reject or override: nothing automatic closes it.
+    """
+    if is_officer_decision(latest):
+        return DECIDED_BY_OFFICER
+    if latest.verdict == NEEDS_HUMAN_REVIEW:
+        return AWAITING_OFFICER
+    return DECIDED_AUTOMATICALLY
 
 
 def original_decision(session: Session, application_id: int) -> Decision | None:

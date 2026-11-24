@@ -65,6 +65,39 @@ The UI reads `API_BASE_URL` (default `http://127.0.0.1:8000`). If the UI says "A
 - **Every page:** a "SYNTHETIC DATA - DEMO ONLY" banner and a status strip (API up/down, provider and model, live or cached extraction).
 - **Display rules:** ID numbers are always masked, and every fact shows where it came from (`live` / `cache` and the model, or "seed fixture").
 
+## Demo click-through
+
+Start from a fresh database (`scripts\seed.py --reset`). The officer name is in the sidebar.
+
+**(a) Resolve the name-mismatch case**
+1. **Choose profile** → `seed-name-mismatch` → **Apply for schemes** → **Apply** under *State Student Scholarship*.
+   - The result is 🟡 Needs officer review: 'Ishan Rao' (identity card, marksheet) vs 'Ishan Rau' (income certificate).
+   - The citizen sees "Waiting for an officer", and *Apply again* is disabled.
+2. **Review queue**: the case is first, shown as ⏳ *awaiting officer decision*. Click **Open case**.
+3. **Conflicts between documents** shows the two spellings side by side. **Approve** is disabled and lists three unresolved flags.
+4. Under *Name on the Income certificate*, choose **Reject: the value is wrong**.
+   - Submitting with an empty reason is refused.
+   - Type `Typo on the income certificate; confirmed with the issuing office` and click **Record resolution**.
+5. The case still shows **Status: awaiting officer decision**, now with **Suggested: ✅ Approved** ("a suggestion only, not a decision"). The decision on record is still *needs officer review*, and Approve is now enabled.
+6. Click **Approve**. Status becomes *decided by officer*, and decision 2 is recorded by `officer:<name>`.
+7. **Audit history** reads:
+   1. Application submitted
+   2. Automatic assessment: needs officer review (original decision). Awaiting officer decision.
+   3. Evidence rejected: Name on the income certificate. Suggested verdict now: approve. Still awaiting officer decision.
+   4. Final officer decision: approved
+
+**(b) Blurry marksheet reaches review**
+1. **Choose profile** → `seed-low-confidence`. The marksheet table shows ⚠️ 3 flagged, with the full reasons ("Image is blurry or low-contrast, so an officer must check it; Confidence 0.62 is below the 0.85 cutoff"), and LOW QUALITY: sharpness 8.3 (min 35), contrast 4.7 (min 15).
+2. **Apply for schemes** → **Apply** under the scholarship. You'll see 🟡 Needs officer review: marks come only from the blurry marksheet, and were read from the marksheet with confidence 62%, below the 85% cutoff.
+3. **Review queue** → **Open case**.
+   - **Low-quality documents** shows the measurements.
+   - Confirming each flagged marksheet fact (with a reason) updates the *Suggested* verdict.
+   - The case closes only when an officer approves, rejects or overrides.
+
+**(c) Below-marks: rejected for the scholarship, then approved for the fee waiver**
+1. **Choose profile** → `seed-below-marks` → **Apply for schemes** → **Apply** under the scholarship. You'll see ❌ Not eligible: marks 52% below 60%, and the income rule passes.
+2. **You may qualify for: Income-Based Fee Waiver** appears. Click **Apply for Income-Based Fee Waiver**: ✅ Approved, with no re-upload.
+
 ## Other commands
 
 ```powershell
@@ -98,9 +131,9 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
 | `GET` | `/profiles` | Profiles for the picker |
 | `GET` | `/profiles/{id}` | Documents, image quality, extraction details, and each fact with its checks and flag reasons |
 | `GET` | `/profiles/{id}/applications` | The profile's applications with their latest decision |
-| `GET` | `/officer/queue` | Applications with their latest decision, `needs_human_review` first. Filter with `?verdict=...` (repeatable). |
+| `GET` | `/officer/queue` | Applications with their status (awaiting officer decision first), latest decision and, for awaiting cases, the suggested verdict. Filter with `?verdict=...` (repeatable). |
 | `GET` | `/officer/cases/{application_id}` | Case detail: latest decision, rule outcomes, current evaluation, conflicts side by side, unresolved flagged facts, documents with image quality, whether approval is allowed and why not |
-| `POST` | `/officer/cases/{application_id}/evidence` | Body `{fact_id, resolution, reason, officer}`, where `resolution` is `confirm` or `reject`. Reason required. Re-evaluates the case (new decision). |
+| `POST` | `/officer/cases/{application_id}/evidence` | Body `{fact_id, resolution, reason, officer}`, where `resolution` is `confirm` or `reject`. Reason required. Returns the suggested verdict on the updated evidence. No decision is recorded. |
 | `POST` | `/officer/cases/{application_id}/decision` | Body `{action, verdict, reason, officer}`, where `action` is `approve`, `reject` or `override`. New decision by the officer. |
 | `GET` | `/applications/{id}/audit` | Audit history: original decision, evidence resolutions, officer actions, with actor and timestamp |
 | `GET` | `/applications/{id}` | Decision history and raw audit events |
@@ -110,12 +143,14 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
 
 ## Officer rules (`backend/officer.py`)
 
-- Every officer action creates a new Decision and an AuditEvent that links to the application's original decision. Decisions are superseded, never edited.
-- **Resolving evidence** means confirming or rejecting one flagged fact, and needs a typed reason. The profile's facts are re-checked (rejecting a misspelt name clears the conflict on the documents that agree), and the case is re-evaluated. Other evaluator-decided applications of the same profile are re-evaluated too.
-- **Approve** is blocked while any flagged fact the scheme relies on is unresolved. It also needs the rules to pass on the current evidence.
-- **Override** sets approve or reject against the evaluator and needs a typed reason. An override to approve is still blocked by unresolved flags.
+- **A review case must end with an officer decision.** An application whose decision is `needs_human_review` stays in the queue as **awaiting officer decision** until an officer approves, rejects, or overrides. Nothing automatic closes it, and the citizen cannot resubmit over it.
+- **Resolving evidence** means confirming or rejecting one flagged fact, and needs a typed reason. It records an audit event, re-checks the profile's facts (rejecting a misspelt name clears the conflict on the documents that agree), and shows the re-evaluated result as **Suggested: <verdict>**. It does not record a decision.
+- **Every officer decision** (approve, reject, override) creates a new Decision and an AuditEvent linked to the application's original decision. Decisions are superseded, never edited.
+- **Approve** is blocked while any flagged fact the scheme relies on is unresolved. It also needs the suggested verdict to be approve.
+- **Override** sets approve or reject against the suggestion and needs a typed reason. An override to approve is still blocked by unresolved flags.
 - **Reject** needs a typed reason.
-- A citizen cannot resubmit over an officer's decision.
+- **When evidence changes**, other applications of the profile that were decided automatically (approve or reject) are reassessed. If the result becomes review, they join the queue too.
+- A citizen cannot resubmit over an officer's decision, or while one is awaited.
 
 There is no login yet. The officer's name comes from the sidebar and is recorded as `officer:<name>`.
 

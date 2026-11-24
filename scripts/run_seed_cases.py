@@ -44,7 +44,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{'profile':<22} {'scheme':<27} {'expected':<19} {'actual':<19}")
         for seed in SEED_PROFILES:
             for scheme_id, expected in seed.expected.items():
-                body = client.post(f"/profiles/{seed.id}/applications", json={"scheme_id": scheme_id}).json()
+                response = client.post(f"/profiles/{seed.id}/applications", json={"scheme_id": scheme_id})
+                if response.status_code == 409:  # awaiting or decided by an officer: show the decision on record
+                    mine = client.get(f"/profiles/{seed.id}/applications").json()
+                    body = next(a["decision"] for a in mine if a["scheme_id"] == scheme_id)
+                else:
+                    body = response.json()
                 mark = "" if body["verdict"] == expected else "  <-- MISMATCH"
                 failures += bool(mark)
                 print(f"{seed.id:<22} {scheme_id:<27} {expected:<19} {body['verdict']:<19}{mark}")

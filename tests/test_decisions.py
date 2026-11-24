@@ -7,7 +7,6 @@ from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 
 from backend.models import AuditEvent, Decision, Fact, ImmutableRecordError
-from backend.service import set_fact_status
 
 SCHOLARSHIP = "state_student_scholarship"
 
@@ -83,31 +82,42 @@ def test_resubmission_appends_a_new_decision(seeded_client, db_session):
     ]
 
 
-def test_correction_then_resubmission_keeps_the_old_decision(seeded_client, db_session):
-    """An officer verifies the blurry marks figure; the new decision approves, the old one stays."""
+def test_correction_then_officer_decision_keeps_the_old_decision(seeded_client, db_session):
+    """An officer confirms the blurry marks figure, then decides; the review decision stays."""
     first = submit(seeded_client, "seed-low-confidence")
     assert first["verdict"] == "needs_human_review"
+    application_id = first["application_id"]
+
+    # While awaiting an officer, the citizen cannot resubmit to get an automatic result.
+    again = seeded_client.post("/profiles/seed-low-confidence/applications", json={"scheme_id": SCHOLARSHIP})
+    assert again.status_code == 409 and "awaiting an officer decision" in again.json()["detail"]
 
     marks_fact_id = first["review_reasons"][0]["fact_ids"][0]
-    fact = db_session.get(Fact, marks_fact_id)
-    assert (fact.field, fact.verification_status) == ("marks_percent", "flagged")
-    set_fact_status(db_session, fact, "verified", actor="officer:demo", note="Checked the original marksheet")
-    db_session.commit()
+    assert db_session.get(Fact, marks_fact_id).field == "marks_percent"
+    flagged = seeded_client.get(f"/officer/cases/{application_id}").json()["unresolved_flags"]
+    for fact in flagged:
+        response = seeded_client.post(f"/officer/cases/{application_id}/evidence", json={
+            "fact_id": fact["fact_id"], "resolution": "confirm", "reason": "Checked the original marksheet",
+            "officer": "demo"})
+        assert response.status_code == 201
+    assert response.json()["suggested_verdict"] == "approve"
+    assert response.json()["status"] == "awaiting officer decision"
 
-    second = submit(seeded_client, "seed-low-confidence")
-    assert second["verdict"] == "approve"
-    assert second["supersedes_decision_id"] == first["decision_id"]
+    decided = seeded_client.post(f"/officer/cases/{application_id}/decision",
+                                 json={"action": "approve", "reason": "", "officer": "demo"}).json()
+    assert (decided["verdict"], decided["sequence"], decided["supersedes_decision_id"]) == (
+        "approve", 2, first["decision_id"])
     db_session.expire_all()
     assert db_session.get(Decision, first["decision_id"]).verdict == "needs_human_review"
 
     events = db_session.scalars(select(AuditEvent).where(AuditEvent.fact_id == marks_fact_id)).all()
-    # observed -> flagged by the automatic checks -> verified by the officer
+    # observed -> flagged by the automatic checks -> confirmed by the officer
     assert [(e.action, e.actor) for e in events] == [
         ("fact.observed", "seed"),
         ("fact.status_changed", "seed"),
-        ("fact.status_changed", "officer:demo"),
+        ("evidence.confirmed", "officer:demo"),
     ]
-    assert [e.details.get("to") for e in events[1:]] == ["flagged", "verified"]
+    assert (events[1].details["to"], events[2].details["fact_to"]) == ("flagged", "verified")
     assert [e.id for e in db_session.get(Fact, marks_fact_id).history] == [e.id for e in events]
 
 

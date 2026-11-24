@@ -263,23 +263,27 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
     @app.get("/officer/queue")
     def officer_queue(verdict: list[str] | None = Query(default=None),
                       session: Session = Depends(get_session)) -> list[dict[str, Any]]:
-        """Applications with their latest decision, needs_human_review first. Filter with ?verdict=..."""
-        return officer.officer_queue(session, schemes, verdict)
+        """Applications with their latest decision, awaiting-officer cases first. Filter with ?verdict=..."""
+        return officer.officer_queue(session, schemes, verdict, cutoff=settings.confidence_cutoff)
 
     @app.get("/officer/cases/{application_id}")
     def case_detail(application_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
         return _officer_errors(lambda: officer.case_detail(
             session, schemes, application_id, cutoff=settings.confidence_cutoff))
 
-    @app.post("/officer/cases/{application_id}/evidence", status_code=201, response_model=DecisionOut)
+    @app.post("/officer/cases/{application_id}/evidence", status_code=201)
     def resolve_evidence(application_id: int, body: EvidenceResolutionRequest,
                          session: Session = Depends(get_session)) -> dict[str, Any]:
-        """Confirm or reject one fact (typed reason required). Creates a re-evaluated Decision."""
-        decision, audit = _officer_errors(lambda: officer.resolve_evidence(
+        """Confirm or reject one fact (typed reason required).
+
+        Returns the re-evaluated *suggested* verdict. No decision is recorded: the case
+        still needs an explicit officer decision.
+        """
+        result = _officer_errors(lambda: officer.resolve_evidence(
             session, schemes, application_id, fact_id=body.fact_id, resolution=body.resolution,
             reason=body.reason, officer=body.officer, cutoff=settings.confidence_cutoff))
         session.commit()
-        return _decision_response(session, decision, audit)
+        return result
 
     @app.post("/officer/cases/{application_id}/decision", status_code=201, response_model=DecisionOut)
     def officer_decision(application_id: int, body: OfficerDecisionRequest,

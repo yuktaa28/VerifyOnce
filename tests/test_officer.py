@@ -53,7 +53,11 @@ def test_queue_lists_needs_review_first_and_filters_by_verdict(seeded_client):
     apply(seeded_client, "seed-name-mismatch")
     queue = seeded_client.get("/officer/queue").json()
     assert [r["verdict"] for r in queue] == ["needs_human_review", "reject", "approve"]
+    assert [r["status"] for r in queue] == [
+        "awaiting officer decision", "decided automatically", "decided automatically"]
     assert queue[0]["profile_id"] == "seed-name-mismatch" and queue[0]["unresolved_flags"] == 3
+    assert queue[0]["suggested_verdict"] == "needs_human_review"  # nothing resolved yet
+    assert queue[1]["suggested_verdict"] is None  # only awaiting cases carry a suggestion
 
     only_review = seeded_client.get("/officer/queue", params={"verdict": "needs_human_review"}).json()
     assert [r["profile_id"] for r in only_review] == ["seed-name-mismatch"]
@@ -141,7 +145,7 @@ def test_plain_approval_needs_the_rules_to_pass_but_an_override_can(seeded_clien
     body = override.json()
     assert (body["verdict"], body["decided_by"], body["supersedes_decision_id"]) == (
         "approve", f"officer:{OFFICER}", first["decision_id"])
-    assert "overrode the evaluator (reject to approve): Grace marks granted by the board" in body["reason"]
+    assert "overrode the suggested verdict (reject to approve): Grace marks granted by the board" in body["reason"]
 
 
 def test_citizen_cannot_resubmit_over_an_officer_decision(seeded_client):
@@ -170,15 +174,24 @@ def test_resolving_the_name_mismatch_then_approving_keeps_the_original_decision(
     resolved = resolve(seeded_client, application_id, names["income_certificate"]["fact_id"], "reject",
                        reason="Typo on the certificate; confirmed with the issuing office")
     assert resolved.status_code == 201, resolved.text
-    assert resolved.json()["verdict"] == "approve"  # re-evaluated on the corrected evidence
+    body = resolved.json()
+    assert (body["suggested_verdict"], body["status"], body["can_approve"]) == (
+        "approve", "awaiting officer decision", True)
+
+    # Only a suggestion: no decision recorded, the case stays in the queue awaiting an officer.
     after = case(seeded_client, application_id)
-    assert after["unresolved_flags"] == [] and after["can_approve"] is True
+    assert after["unresolved_flags"] == [] and after["awaiting_officer_decision"] is True
+    assert (after["decision"]["verdict"], after["suggested_verdict"]) == ("needs_human_review", "approve")
+    assert len(after["decisions"]) == 1
+    row = next(r for r in seeded_client.get("/officer/queue").json() if r["application_id"] == application_id)
+    assert (row["status"], row["suggested_verdict"]) == ("awaiting officer decision", "approve")
 
     approved = decide(seeded_client, application_id, "approve", "Identity confirmed")
     assert approved.status_code == 201, approved.text
     assert approved.json()["decided_by"] == f"officer:{OFFICER}"
+    assert case(seeded_client, application_id)["status"] == "decided by officer"
 
-    # The original decision is untouched; three decisions in a superseding chain.
+    # The original decision is untouched; two decisions in a superseding chain.
     db_session.expire_all()
     original = db_session.get(Decision, first["decision_id"])
     assert (original.verdict, original.decided_by, original.reason) == (
@@ -187,8 +200,7 @@ def test_resolving_the_name_mismatch_then_approving_keeps_the_original_decision(
     assert audit["original_decision_id"] == first["decision_id"]
     assert [(d["sequence"], d["verdict"], d["decided_by"]) for d in audit["decisions"]] == [
         (1, "needs_human_review", "evaluator"),
-        (2, "approve", "evaluator"),
-        (3, "approve", f"officer:{OFFICER}"),
+        (2, "approve", f"officer:{OFFICER}"),
     ]
     events = [(e["action"], e["actor"], e["is_original_decision"]) for e in audit["events"]]
     assert events == [
@@ -197,24 +209,68 @@ def test_resolving_the_name_mismatch_then_approving_keeps_the_original_decision(
         ("evidence.rejected", f"officer:{OFFICER}", False),
         ("decision.officer_approved", f"officer:{OFFICER}", False),
     ]
+    assert [e["summary"] for e in audit["events"]] == [
+        "Application submitted",
+        "Automatic assessment: needs officer review (original decision). Awaiting officer decision.",
+        "Evidence rejected: Name on the income certificate. Suggested verdict now: approve. "
+        "Still awaiting officer decision.",
+        "Final officer decision: approved",
+    ]
     resolution = audit["events"][2]
     assert resolution["reason"] == "Typo on the certificate; confirmed with the issuing office"
     assert resolution["fact_id"] == names["income_certificate"]["fact_id"]
+    assert resolution["decision_id"] == first["decision_id"]  # the decision under review
     assert resolution["details"]["original_decision_id"] == first["decision_id"]
     assert all(e["at"] for e in audit["events"])  # every entry is timestamped
 
 
-def test_resolving_evidence_reevaluates_the_profiles_other_open_applications(seeded_client):
+def test_reviews_stay_with_the_officer_and_automatic_decisions_refresh(seeded_client):
+    # Both name-mismatch applications await an officer: resolving one only updates suggestions.
     scholarship = apply(seeded_client, "seed-name-mismatch")
     waiver = apply(seeded_client, "seed-name-mismatch", FEE_WAIVER)
     names = flagged_name_facts(case(seeded_client, scholarship["application_id"]))
     resolve(seeded_client, scholarship["application_id"], names["income_certificate"]["fact_id"], "reject",
             reason="Typo on the certificate")
     waiver_case = case(seeded_client, waiver["application_id"])
-    assert waiver_case["decision"]["verdict"] == "approve"
-    assert [d["sequence"] for d in waiver_case["decisions"]] == [1, 2]
-    events = seeded_client.get(f"/applications/{waiver['application_id']}/audit").json()["events"]
-    assert events[-1]["action"] == "decision.reevaluated"
+    assert (waiver_case["decision"]["verdict"], waiver_case["suggested_verdict"]) == ("needs_human_review", "approve")
+    assert waiver_case["awaiting_officer_decision"] and len(waiver_case["decisions"]) == 1
+
+    # An automatic approval whose evidence an officer rejects is reassessed, and now awaits an officer.
+    blurry = apply(seeded_client, "seed-low-confidence")
+    auto = apply(seeded_client, "seed-low-confidence", FEE_WAIVER)
+    assert auto["verdict"] == "approve"
+    income = next(f for d in case(seeded_client, blurry["application_id"])["documents"] for f in d["facts"]
+                  if f["field"] == "annual_income_inr")
+    resolve(seeded_client, blurry["application_id"], income["fact_id"], "reject", reason="Certificate is forged")
+    auto_case = case(seeded_client, auto["application_id"])
+    assert (auto_case["decision"]["verdict"], auto_case["status"]) == ("needs_human_review", "awaiting officer decision")
+    events = seeded_client.get(f"/applications/{auto['application_id']}/audit").json()["events"]
+    assert events[-1]["summary"] == "Automatic reassessment after evidence changed: needs officer review"
+    assert case(seeded_client, blurry["application_id"])["decision"]["sequence"] == 1  # still awaiting
+
+
+def test_citizen_cannot_resubmit_while_awaiting_an_officer(seeded_client):
+    apply(seeded_client, "seed-name-mismatch")
+    response = seeded_client.post("/profiles/seed-name-mismatch/applications", json={"scheme_id": SCHOLARSHIP})
+    assert response.status_code == 409
+    assert "awaiting an officer decision" in response.json()["detail"]
+
+
+@pytest.mark.parametrize(("action", "verdict", "reason", "expected"), [
+    ("reject", None, "Income certificate could not be verified", "reject"),
+    ("override", "reject", "Applicant withdrew the application", "reject"),
+])
+def test_review_cases_close_only_with_an_officer_decision(seeded_client, action, verdict, reason, expected):
+    first = apply(seeded_client, "seed-name-mismatch")
+    application_id = first["application_id"]
+    assert case(seeded_client, application_id)["status"] == "awaiting officer decision"
+    response = decide(seeded_client, application_id, action, reason, verdict=verdict)
+    assert response.status_code == 201, response.text
+    assert response.json()["verdict"] == expected
+    detail = case(seeded_client, application_id)
+    assert (detail["status"], detail["awaiting_officer_decision"]) == ("decided by officer", False)
+    queue = seeded_client.get("/officer/queue").json()
+    assert all(r["status"] != "awaiting officer decision" for r in queue)
 
 
 # --- Flow (b): the blurry marksheet reaches review and is resolved -----------------------------
@@ -232,8 +288,11 @@ def test_blurry_marksheet_case_reaches_review_and_can_be_resolved(seeded_client)
     for fact in flagged.values():
         assert resolve(seeded_client, application_id, fact["fact_id"], "confirm",
                        reason="Matches the original marksheet").status_code == 201
-    final = case(seeded_client, application_id)
-    assert final["can_approve"] is True and final["decision"]["verdict"] == "approve"
+    resolved = case(seeded_client, application_id)
+    assert resolved["can_approve"] is True and resolved["suggested_verdict"] == "approve"
+    assert resolved["decision"]["verdict"] == "needs_human_review"  # still the officer's call
+    assert decide(seeded_client, application_id, "approve").status_code == 201
+    assert case(seeded_client, application_id)["decision"]["verdict"] == "approve"
 
 
 # --- Flow (c): below marks rejected for the scholarship, approved for the fee waiver -----------

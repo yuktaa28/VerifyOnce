@@ -98,7 +98,8 @@ def test_low_confidence_names_the_field_and_score(seeded_client):
         ("marks_percent", "low_confidence"),
     ]
     assert "blurry or low-contrast" in body["reason"]
-    assert "62%, below the 85% cutoff" in body["reason"]
+    assert "marks percentage was read from the marksheet with confidence 62%, below the 85% cutoff" in body["reason"]
+    assert "read at" not in body["reason"]
     # The blurry marksheet's name agrees with the confident copies, so it does not block,
     # and the fee waiver (no marks rule) is offered instead.
     assert [s["scheme_id"] for s in body["possible_schemes"]] == [FEE_WAIVER]

@@ -49,12 +49,15 @@ for scheme in schemes:
         for rule in scheme["rules"]:
             top[0].markdown(f"- `{rule['id']}`: {rule['description']}")
         by_officer = bool(existing and existing["decided_by_officer"])
+        awaiting = bool(existing and existing["awaiting_officer_decision"])
         if existing:
             top[1].markdown(f"Status: **{ui.verdict_label(existing['decision']['verdict'])}**")
             if by_officer:
                 top[1].caption("Decided by an officer.")
+            if awaiting:
+                top[1].caption("Waiting for an officer. Documents you upload are included in their review.")
         if top[1].button("Apply" if not existing else "Apply again", key=f"apply-{scheme['id']}",
-                         disabled=by_officer, type="primary"):
+                         disabled=by_officer or awaiting, type="primary"):
             apply_for(scheme["id"])
             st.rerun()
         decision = results.get(scheme["id"]) or (existing["decision"] if existing else None)
