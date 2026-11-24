@@ -364,7 +364,7 @@ def _issue_message(ev: FieldEvidence, issue: str, cutoff: float) -> str:
         return f"{label} could not be used " + "; ".join(parts)
     if issue == LOW_QUALITY_IMAGE:
         docs = ", ".join(sorted({document_label(o.document_type) for o in ev.readable if o.low_quality_image}))
-        return f"{label} comes only from the {docs}, whose image is blurry or low-contrast; needs human review"
+        return f"{label} comes only from the {docs}, whose image is blurry or low-contrast"
     if issue == LOW_CONFIDENCE:
         best = ev.best
         return (

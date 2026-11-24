@@ -16,8 +16,8 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from backend.config import DEFAULT_CONFIDENCE_CUTOFF
-from backend.image_quality import quality_check
+from backend.config import DEFAULT_CONFIDENCE_CUTOFF, REPO_ROOT
+from backend.image_quality import assess, quality_check
 from backend.models import Profile
 from backend.service import add_document, add_fact, create_profile
 from backend.verification import verify_profile
@@ -165,11 +165,28 @@ SEED_PROFILES: tuple[SeedProfile, ...] = (
 )
 
 
+DOCUMENTS_DIR = REPO_ROOT / "data" / "documents"
+
+
+def _seed_image_quality(case_id: str, doc: SeedDocument) -> tuple[dict[str, Any], str | None, str | None]:
+    """Measure the generated image when it exists; otherwise fall back to the seed's quality label.
+
+    Returns (image_quality, filename, detail for the passed check).
+    """
+    images = sorted((DOCUMENTS_DIR / case_id).glob(f"{doc.document_type}.*")) if DOCUMENTS_DIR.is_dir() else []
+    images = [p for p in images if p.suffix.lower() in {".png", ".jpg", ".jpeg"}]
+    if images:
+        quality = assess(images[0].read_bytes())
+        return {**quality.as_dict(), "source": "seed image"}, images[0].name, quality.describe()
+    ok = doc.quality == "clean"
+    return {"source": "seed label", "quality": doc.quality, "ok": ok}, None, "seed document marked clean"
+
+
 def seed_database(session: Session, *, confidence_cutoff: float = DEFAULT_CONFIDENCE_CUTOFF) -> list[str]:
     """Insert any seed profile that is not in the database yet, then verify its facts.
 
-    A seed document's ``quality`` stands in for the image-quality measurement, so a
-    "blurry" seed document flags its facts exactly as the uploaded image does.
+    Each seed document is measured from its generated image in data/documents, so the
+    blurry marksheet flags its facts exactly as an upload of that image does.
     Returns the ids created.
     """
     created = []
@@ -178,10 +195,10 @@ def seed_database(session: Session, *, confidence_cutoff: float = DEFAULT_CONFID
             continue
         profile = create_profile(session, seed.id, label=seed.label, actor=SEED_ACTOR)
         for doc in seed.documents:
-            ok = doc.quality == "clean"
+            image_quality, filename, detail = _seed_image_quality(seed.id, doc)
             document = add_document(session, profile, doc.document_type, actor=SEED_ACTOR, source="seed",
-                                    image_quality={"source": "seed", "quality": doc.quality, "ok": ok})
-            check = quality_check(ok, "seed document marked clean")
+                                    filename=filename, image_quality=image_quality)
+            check = quality_check(image_quality["ok"], detail)
             for field, (raw, confidence) in doc.facts.items():
                 add_fact(session, document, field, raw, confidence, actor=SEED_ACTOR, extra_checks=[check])
         verify_profile(session, profile.id, confidence_cutoff=confidence_cutoff, actor=SEED_ACTOR)

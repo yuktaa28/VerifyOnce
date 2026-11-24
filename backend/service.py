@@ -38,6 +38,10 @@ class UnknownScheme(LookupError):
     pass
 
 
+class AlreadyDecided(RuntimeError):
+    """An officer has decided this application; a citizen resubmission must not overwrite it."""
+
+
 # --- Profiles, documents, facts -------------------------------------------------------
 
 
@@ -217,15 +221,23 @@ def profile_observations(session: Session, profile_id: str) -> list[Observation]
 
 
 def fact_payload(fact: Fact) -> dict[str, Any]:
+    """A fact with its checks, plain-language flag reasons and where it came from."""
+    document = fact.document
     return {
         "fact_id": fact.id,
         "document_id": fact.document_id,
+        "document_type": document.document_type,
         "field": fact.field,
         "value": fact.value_json,
         "confidence": fact.confidence,
         "verification_status": fact.verification_status,
         "reviewed_by": fact.reviewed_by,
+        "flag_reasons": [c["message"] for c in fact.checks or [] if not c.get("passed")],
         "checks": fact.checks,
+        "source": document.source,
+        "extraction_source": document.extraction_source,
+        "extraction_model": document.extraction_model,
+        "image_quality_ok": (document.image_quality or {}).get("ok"),
     }
 
 
@@ -266,8 +278,51 @@ def submit_application(
         )
 
     previous = latest_decision(session, application.id)
+    if previous is not None and is_officer_decision(previous):
+        raise AlreadyDecided(
+            f"{scheme.name} was decided by an officer ({previous.verdict}); ask the office to reopen it"
+        )
     result = evaluate(scheme, profile_observations(session, profile_id), confidence_cutoff)
+    return record_decision(
+        session, application, scheme, result, confidence_cutoff=confidence_cutoff,
+        decided_by="evaluator", actor=actor,
+        action="decision.resubmitted" if previous else "decision.created",
+    )
 
+
+def is_officer_decision(decision: Decision) -> bool:
+    return decision.decided_by.startswith("officer:")
+
+
+def original_decision(session: Session, application_id: int) -> Decision | None:
+    return session.scalar(
+        select(Decision).where(Decision.application_id == application_id).order_by(Decision.sequence).limit(1)
+    )
+
+
+def record_decision(
+    session: Session,
+    application: Application,
+    scheme: Scheme,
+    result: Any,
+    *,
+    confidence_cutoff: float,
+    decided_by: str,
+    actor: str,
+    action: str,
+    verdict: str | None = None,
+    reason: str | None = None,
+    fact_id: int | None = None,
+    details: dict[str, Any] | None = None,
+) -> tuple[Decision, AuditEvent]:
+    """Store a new immutable Decision that supersedes the latest one, plus its AuditEvent.
+
+    ``result`` is an EvaluationResult: its rule outcomes and evidence snapshot are kept
+    even when an officer sets a different verdict. The audit event links the new
+    decision, the one it supersedes, and the application's original decision.
+    """
+    previous = latest_decision(session, application.id)
+    first = original_decision(session, application.id)
     decision = Decision(
         application_id=application.id,
         sequence=(previous.sequence + 1) if previous else 1,
@@ -275,31 +330,35 @@ def submit_application(
         scheme_id=scheme.id,
         ruleset_version=scheme.ruleset_version,
         confidence_cutoff=confidence_cutoff,
-        verdict=result.verdict,
-        reason=result.reason,
+        verdict=verdict or result.verdict,
+        reason=reason or result.reason,
         explanation=None,
         rule_outcomes=result.rule_outcomes_json(),
         evaluated_values=result.evaluated_values,
         source_facts=result.source_facts,
         mismatches=result.mismatches,
         review_reasons=result.review_reasons_json(),
-        decided_by="evaluator",
+        decided_by=decided_by,
     )
     session.add(decision)
     session.flush()
 
     audit = AuditEvent(
         actor=actor,
-        action="decision.resubmitted" if previous else "decision.created",
-        profile_id=profile_id,
+        action=action,
+        profile_id=application.profile_id,
         application_id=application.id,
         decision_id=decision.id,
+        fact_id=fact_id,
         details={
             "verdict": decision.verdict,
+            "evaluator_verdict": result.verdict,
             "ruleset_version": decision.ruleset_version,
             "sequence": decision.sequence,
             "supersedes_decision_id": decision.supersedes_decision_id,
             "previous_verdict": previous.verdict if previous else None,
+            "original_decision_id": first.id if first else decision.id,
+            **(details or {}),
         },
     )
     session.add(audit)
@@ -355,6 +414,16 @@ def decision_payload(
     audit_event_id: int | None,
     possible: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    rules = {rule.id: rule for rule in scheme.rules}
+    documents = {f["fact_id"]: f["document_type"] for f in decision.source_facts}
+    outcomes = [
+        {
+            **outcome,
+            "requirement": (rules[outcome["rule_id"]].description if outcome["rule_id"] in rules else None),
+            "source_documents": sorted({documents[i] for i in outcome["source_fact_ids"] if documents.get(i)}),
+        }
+        for outcome in decision.rule_outcomes
+    ]
     return {
         "decision_id": decision.id,
         "application_id": decision.application_id,
@@ -368,7 +437,7 @@ def decision_payload(
         "reason": decision.reason,
         "explanation": decision.explanation,
         "confidence_cutoff": decision.confidence_cutoff,
-        "rule_outcomes": decision.rule_outcomes,
+        "rule_outcomes": outcomes,
         "source_facts": decision.source_facts,
         "evaluated_values": decision.evaluated_values,
         "mismatches": decision.mismatches,

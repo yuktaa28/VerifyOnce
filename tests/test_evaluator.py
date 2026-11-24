@@ -175,8 +175,9 @@ def test_field_read_only_from_a_blurry_image_needs_review_even_at_full_confidenc
     result = evaluate(schemes[SCHOLARSHIP], blurry_marksheet_profile(marks_conf=1.0))
     assert result.verdict == NEEDS_HUMAN_REVIEW
     assert [(r.field, r.issue) for r in result.review_reasons] == [("marks_percent", LOW_QUALITY_IMAGE)]
-    assert ("marks percentage comes only from the marksheet, whose image is blurry or low-contrast; "
-            "needs human review") in result.reason
+    assert result.reason.endswith(
+        "because marks percentage comes only from the marksheet, whose image is blurry or low-contrast.")
+    assert ";" not in result.review_reasons[0].message  # joins cleanly with other reasons
 
 
 def test_blurry_reading_that_agrees_with_a_good_document_is_covered(schemes):

@@ -9,7 +9,7 @@ Built for Homingo Hackathon Edition 01, Automation track, problem statement B2: 
 | Path | Contents |
 |---|---|
 | `backend/` | FastAPI service: data model, extraction, verification, evaluator |
-| `frontend/` | Streamlit app (coming in a later step) |
+| `frontend/` | Streamlit app (citizen and officer pages). It calls the API over HTTP and holds no business logic. |
 | `schemes/` | One YAML file per scheme: rules, thresholds, ruleset version |
 | `scripts/` | Seed loader, document generator, live extraction check, seed-case runner |
 | `tests/` | pytest suite (live API tests are opt-in) |
@@ -41,7 +41,31 @@ Then edit `.env` and fill in your own values. `.env` is git-ignored: never commi
 
 A shell variable overrides `.env`, for example `$env:EXTRACTION_USE_CACHE="1"`.
 
-## Run
+## Run the app (two PowerShell windows)
+
+Window 1, the API:
+
+```powershell
+cd C:\Users\YUKTA\OneDrive\PROJECTS\VerifyOnce
+.venv\Scripts\python.exe scripts\seed.py --reset
+.venv\Scripts\python.exe -m uvicorn backend.main:app --port 8000
+```
+
+Window 2, the UI (opens http://localhost:8501):
+
+```powershell
+cd C:\Users\YUKTA\OneDrive\PROJECTS\VerifyOnce
+.venv\Scripts\python.exe -m streamlit run frontend\app.py --server.port 8501
+```
+
+The UI reads `API_BASE_URL` (default `http://127.0.0.1:8000`). If the UI says "API down", start window 1 and refresh the page.
+
+- **Citizen pages:** choose a profile, upload documents, apply for schemes.
+- **Officer pages:** review queue, case view.
+- **Every page:** a "SYNTHETIC DATA - DEMO ONLY" banner and a status strip (API up/down, provider and model, live or cached extraction).
+- **Display rules:** ID numbers are always masked, and every fact shows where it came from (`live` / `cache` and the model, or "seed fixture").
+
+## Other commands
 
 ```powershell
 python scripts/seed.py --reset              # fresh database with the five seed profiles
@@ -70,11 +94,30 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
 | Method | Path | Returns |
 |---|---|---|
 | `POST` | `/profiles/{id}/documents` | Multipart `document_type` (`identity_card`, `income_certificate`, `marksheet`) and `file` (PNG, JPEG, GIF or WEBP). Extracts the fields, then returns each normalized fact with its confidence, validator results and status, plus the document status, `extraction_source` and the raw model replies. Creates the profile if needed. |
-| `POST` | `/profiles/{id}/applications` | Body `{"scheme_id": ...}`. Creates a new decision: verdict, per-rule outcomes, source facts, mismatches, plain-language reason, `possible_schemes`. Resubmitting adds a new decision; it never overwrites. |
-| `GET` | `/profiles/{id}` | Documents, extraction details, and each fact with its checks |
-| `GET` | `/applications/{id}` | Decision history and audit trail |
+| `POST` | `/profiles/{id}/applications` | Body `{"scheme_id": ...}`. Creates a new decision: verdict, per-rule outcomes (with requirement and source document), source facts, mismatches, plain-language reason, `possible_schemes`. Resubmitting adds a new decision; it never overwrites. Refused (409) once an officer has decided the application. |
+| `GET` | `/profiles` | Profiles for the picker |
+| `GET` | `/profiles/{id}` | Documents, image quality, extraction details, and each fact with its checks and flag reasons |
+| `GET` | `/profiles/{id}/applications` | The profile's applications with their latest decision |
+| `GET` | `/officer/queue` | Applications with their latest decision, `needs_human_review` first. Filter with `?verdict=...` (repeatable). |
+| `GET` | `/officer/cases/{application_id}` | Case detail: latest decision, rule outcomes, current evaluation, conflicts side by side, unresolved flagged facts, documents with image quality, whether approval is allowed and why not |
+| `POST` | `/officer/cases/{application_id}/evidence` | Body `{fact_id, resolution, reason, officer}`, where `resolution` is `confirm` or `reject`. Reason required. Re-evaluates the case (new decision). |
+| `POST` | `/officer/cases/{application_id}/decision` | Body `{action, verdict, reason, officer}`, where `action` is `approve`, `reject` or `override`. New decision by the officer. |
+| `GET` | `/applications/{id}/audit` | Audit history: original decision, evidence resolutions, officer actions, with actor and timestamp |
+| `GET` | `/applications/{id}` | Decision history and raw audit events |
 | `GET` | `/schemes` | Loaded schemes and rules |
+| `GET` | `/status` | API status, provider and model, live or cached extraction, whether a key is set (never the key) |
 | `GET` | `/health` | Status |
+
+## Officer rules (`backend/officer.py`)
+
+- Every officer action creates a new Decision and an AuditEvent that links to the application's original decision. Decisions are superseded, never edited.
+- **Resolving evidence** means confirming or rejecting one flagged fact, and needs a typed reason. The profile's facts are re-checked (rejecting a misspelt name clears the conflict on the documents that agree), and the case is re-evaluated. Other evaluator-decided applications of the same profile are re-evaluated too.
+- **Approve** is blocked while any flagged fact the scheme relies on is unresolved. It also needs the rules to pass on the current evidence.
+- **Override** sets approve or reject against the evaluator and needs a typed reason. An override to approve is still blocked by unresolved flags.
+- **Reject** needs a typed reason.
+- A citizen cannot resubmit over an officer's decision.
+
+There is no login yet. The officer's name comes from the sidebar and is recorded as `officer:<name>`.
 
 ## How a document becomes facts
 
@@ -96,7 +139,7 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
 
    Each new upload re-checks the whole profile, so a later document can flag an earlier fact. Facts an officer has reviewed keep the officer's status.
 3. **Image quality** (`backend/image_quality.py`). Every upload is measured directly, with no model involved: sharpness is the variance of a Laplacian filter (after light smoothing, so scanner grain doesn't count), and contrast is the standard deviation of the grey levels. Both are measured at a fixed 1000-pixel width.
-   - A document below either threshold (sharpness 35, contrast 15) is low quality. Every fact from it is flagged with "Image is blurry or low-contrast; needs human review", even if the model reported full confidence.
+   - A document below either threshold (sharpness 35, contrast 15) is low quality. Every fact from it is flagged with "Image is blurry or low-contrast, so an officer must check it", even if the model reported full confidence.
    - The thresholds come from our 16 synthetic documents: the clean ones score 137-217 sharpness and 42-67 contrast; the blurry marksheet scores 8.3 and 4.7.
    - Real phone photos may need the thresholds re-tuned.
 

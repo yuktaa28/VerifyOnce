@@ -112,7 +112,7 @@ def test_blurry_marksheet_with_a_misread_birth_year_goes_to_review(upload_client
     # 1. The image-quality check flags every fact from the blurry marksheet.
     for fact in sheet_facts.values():
         assert fact["verification_status"] == "flagged"
-        assert "Image is blurry or low-contrast; needs human review" in failed_checks(fact)
+        assert "Image is blurry or low-contrast, so an officer must check it" in failed_checks(fact)
     # 2. 0.8 is below the 0.85 cutoff.
     assert "Confidence 0.80 is below the 0.85 cutoff" in failed_checks(sheet_facts["date_of_birth"])
     # 3. The wrong birth year conflicts with the identity card, which is flagged too.

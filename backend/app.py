@@ -6,16 +6,17 @@ from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
-from backend import service
-from backend.api_models import ApplicationRequest, DecisionOut
+from backend import officer, service
+from backend.api_models import ApplicationRequest, DecisionOut, EvidenceResolutionRequest, OfficerDecisionRequest
 from backend.config import Settings
 from backend.db import init_db, make_engine, make_session_factory
 from backend.extraction import DOCUMENT_SCHEMAS, MAX_IMAGE_BYTES, Extractor, image_media_type
+from backend.image_quality import MIN_CONTRAST, MIN_SHARPNESS
 from backend.models import Application, AuditEvent, Document, Profile
 from backend.schemes import load_schemes
 
@@ -64,6 +65,31 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
     @app.get("/health")
     def health() -> dict[str, Any]:
         return {"status": "ok", "schemes": list(schemes)}
+
+    @app.get("/status")
+    def status() -> dict[str, Any]:
+        """What the UI's status strip shows. Says whether a key is set, never the key."""
+        ex = app.state.extractor
+        return {
+            "status": "ok",
+            "provider": ex.provider.name,
+            "model": ex.provider.model,
+            "provider_key_set": ex.provider.missing_configuration() is None,
+            "extraction_mode": "cache first" if ex.use_cache else "live",
+            "confidence_cutoff": settings.confidence_cutoff,
+            "image_quality_thresholds": {"min_sharpness": MIN_SHARPNESS, "min_contrast": MIN_CONTRAST},
+            "schemes": list(schemes),
+        }
+
+    @app.get("/profiles")
+    def list_profiles(session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+        return officer.list_profiles(session)
+
+    @app.get("/profiles/{profile_id}/applications")
+    def profile_applications(profile_id: str, session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+        if session.get(Profile, profile_id) is None:
+            raise HTTPException(404, f"Profile {profile_id!r} not found")
+        return officer.profile_applications(session, schemes, profile_id)
 
     @app.get("/schemes")
     def list_schemes() -> list[dict[str, Any]]:
@@ -161,6 +187,8 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             raise HTTPException(404, f"Profile {profile_id!r} not found") from None
         except service.UnknownScheme:
             raise HTTPException(422, f"Unknown scheme_id {body.scheme_id!r}; see GET /schemes") from None
+        except service.AlreadyDecided as exc:
+            raise HTTPException(409, str(exc)) from None
         session.commit()
         possible = service.possible_schemes(
             session, schemes, profile_id, exclude=body.scheme_id, confidence_cutoff=cutoff
@@ -207,5 +235,60 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
                 for e in events
             ],
         }
+
+    @app.get("/applications/{application_id}/audit")
+    def application_audit(application_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
+        try:
+            return officer.application_audit(session, application_id)
+        except officer.CaseNotFound as exc:
+            raise HTTPException(404, str(exc)) from None
+
+    # --- Officer -----------------------------------------------------------------------
+
+    def _officer_errors(call):
+        try:
+            return call()
+        except officer.CaseNotFound as exc:
+            raise HTTPException(404, str(exc)) from None
+        except officer.ReasonRequired as exc:
+            raise HTTPException(422, str(exc)) from None
+        except officer.ActionRefused as exc:
+            raise HTTPException(409, str(exc)) from None
+
+    def _decision_response(session: Session, decision, audit) -> dict[str, Any]:
+        application = session.get(Application, decision.application_id)
+        return service.decision_payload(decision, profile_id=application.profile_id,
+                                        scheme=schemes[application.scheme_id], audit_event_id=audit.id, possible=[])
+
+    @app.get("/officer/queue")
+    def officer_queue(verdict: list[str] | None = Query(default=None),
+                      session: Session = Depends(get_session)) -> list[dict[str, Any]]:
+        """Applications with their latest decision, needs_human_review first. Filter with ?verdict=..."""
+        return officer.officer_queue(session, schemes, verdict)
+
+    @app.get("/officer/cases/{application_id}")
+    def case_detail(application_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
+        return _officer_errors(lambda: officer.case_detail(
+            session, schemes, application_id, cutoff=settings.confidence_cutoff))
+
+    @app.post("/officer/cases/{application_id}/evidence", status_code=201, response_model=DecisionOut)
+    def resolve_evidence(application_id: int, body: EvidenceResolutionRequest,
+                         session: Session = Depends(get_session)) -> dict[str, Any]:
+        """Confirm or reject one fact (typed reason required). Creates a re-evaluated Decision."""
+        decision, audit = _officer_errors(lambda: officer.resolve_evidence(
+            session, schemes, application_id, fact_id=body.fact_id, resolution=body.resolution,
+            reason=body.reason, officer=body.officer, cutoff=settings.confidence_cutoff))
+        session.commit()
+        return _decision_response(session, decision, audit)
+
+    @app.post("/officer/cases/{application_id}/decision", status_code=201, response_model=DecisionOut)
+    def officer_decision(application_id: int, body: OfficerDecisionRequest,
+                         session: Session = Depends(get_session)) -> dict[str, Any]:
+        """approve / reject / override. Approval is refused (409) while flagged evidence is unresolved."""
+        decision, audit = _officer_errors(lambda: officer.officer_decide(
+            session, schemes, application_id, action=body.action, verdict=body.verdict,
+            reason=body.reason, officer=body.officer, cutoff=settings.confidence_cutoff))
+        session.commit()
+        return _decision_response(session, decision, audit)
 
     return app

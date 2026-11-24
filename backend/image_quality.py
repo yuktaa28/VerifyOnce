@@ -38,7 +38,7 @@ from PIL import Image, ImageFilter
 REFERENCE_WIDTH = 1000
 MIN_SHARPNESS = 35.0
 MIN_CONTRAST = 15.0
-LOW_QUALITY_REASON = "Image is blurry or low-contrast; needs human review"
+LOW_QUALITY_REASON = "Image is blurry or low-contrast, so an officer must check it"
 CHECK_NAME = "image_quality"
 
 

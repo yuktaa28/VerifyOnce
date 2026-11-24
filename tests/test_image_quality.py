@@ -65,6 +65,8 @@ def test_measurement_is_deterministic():
 
 
 def test_quality_check_messages():
-    assert quality_check(False)["message"] == LOW_QUALITY_REASON == "Image is blurry or low-contrast; needs human review"
+    assert quality_check(False)["message"] == LOW_QUALITY_REASON == (
+        "Image is blurry or low-contrast, so an officer must check it")
+    assert ";" not in LOW_QUALITY_REASON  # reasons are joined with semicolons
     passed = quality_check(True, "sharpness 180.0")
     assert passed["passed"] and passed["kind"] == "image_quality"

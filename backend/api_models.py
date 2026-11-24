@@ -3,13 +3,27 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
 
 class ApplicationRequest(BaseModel):
     scheme_id: str
+
+
+class EvidenceResolutionRequest(BaseModel):
+    fact_id: int
+    resolution: Literal["confirm", "reject"]
+    reason: str = ""
+    officer: str = ""
+
+
+class OfficerDecisionRequest(BaseModel):
+    action: Literal["approve", "reject", "override"]
+    verdict: Literal["approve", "reject"] | None = None
+    reason: str = ""
+    officer: str = ""
 
 
 class RuleOutcomeOut(BaseModel):
@@ -22,6 +36,8 @@ class RuleOutcomeOut(BaseModel):
     evidence_issues: list[str]
     source_fact_ids: list[int]
     message: str
+    requirement: str | None = None
+    source_documents: list[str] = []
 
 
 class SourceFactOut(BaseModel):
@@ -33,6 +49,7 @@ class SourceFactOut(BaseModel):
     confidence: float
     verification_status: str
     problem: str | None = None
+    low_quality_image: bool = False
 
 
 class MismatchOut(BaseModel):
