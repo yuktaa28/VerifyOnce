@@ -15,6 +15,8 @@ from sqlalchemy.orm import Session, selectinload
 from backend.evaluator import APPROVE, NEEDS_HUMAN_REVIEW, Observation, evaluate
 from backend.extraction import DOCUMENT_FIELDS, ExtractionResult, Extractor
 from backend.fields import FIELD_TYPES, to_json_value
+from backend.image_quality import assess as assess_image
+from backend.image_quality import quality_check
 from backend.models import (
     VERIFICATION_STATUSES,
     Application,
@@ -57,6 +59,7 @@ def add_document(
     source: str = "upload",
     sha256: str | None = None,
     extraction: ExtractionResult | None = None,
+    image_quality: dict[str, Any] | None = None,
 ) -> Document:
     document = Document(
         profile=profile,
@@ -68,6 +71,7 @@ def add_document(
         extraction_source=extraction.extraction_source if extraction else None,
         extraction_model=extraction.model if extraction else None,
         extraction_error=extraction.error if extraction else None,
+        image_quality=image_quality,
     )
     session.add(document)
     session.flush()
@@ -76,7 +80,8 @@ def add_document(
             actor=actor,
             action="document.added",
             profile_id=profile.id,
-            details={"document_id": document.id, "document_type": document_type, "source": source},
+            details={"document_id": document.id, "document_type": document_type, "source": source,
+                     "image_quality_ok": image_quality.get("ok") if image_quality else None},
         )
     )
     return document
@@ -90,12 +95,14 @@ def add_fact(
     confidence: float,
     *,
     actor: str,
+    extra_checks: list[dict[str, Any]] | None = None,
 ) -> Fact:
     """Record one observation, unverified, after running the field's validators.
 
     The stored value is typed and ID numbers are cut to their last 4 digits. If the raw
     value is unreadable or fails a validator, the stored value is empty and the failed
-    check says why. ``verify_profile`` then sets the status.
+    check says why. ``extra_checks`` (such as the document's image-quality check) are
+    stored alongside. ``verify_profile`` then sets the status.
     """
     value, checks = validate(field, raw_value)
     fact = Fact(
@@ -105,7 +112,7 @@ def add_fact(
         value_json=to_json_value(field, value) if value is not None else None,
         confidence=confidence,
         verification_status="unverified",
-        checks=[c.as_dict() for c in checks],
+        checks=[c.as_dict() for c in checks] + list(extra_checks or []),
     )
     session.add(fact)
     session.flush()
@@ -135,17 +142,21 @@ def ingest_document(
 ) -> tuple[Document, ExtractionResult, list[dict[str, Any]]]:
     """Extract one uploaded document, store its facts, and re-verify the whole profile.
 
+    The image is also measured deterministically (``backend.image_quality``). A blurry
+    or low-contrast image flags every fact read from it, whatever the model's confidence.
     A failed extraction still stores one empty fact per field, so every field is
     flagged and the profile goes to an officer instead of silently missing data.
     """
     profile = session.get(Profile, profile_id)
     if profile is None:
         profile = create_profile(session, profile_id, actor=actor)
+    quality = assess_image(content)
     result = extractor.extract(content, document_type)
     document = add_document(
         session, profile, document_type, actor=actor, filename=filename, source="upload",
-        sha256=hashlib.sha256(content).hexdigest(), extraction=result,
+        sha256=hashlib.sha256(content).hexdigest(), extraction=result, image_quality=quality.as_dict(),
     )
+    check = quality_check(quality.ok, quality.describe())
     for field in DOCUMENT_FIELDS[document_type]:
         reading = result.readings.get(field) if result.ok else None
         add_fact(
@@ -153,6 +164,7 @@ def ingest_document(
             reading["value"] if reading else None,
             float(reading["confidence"]) if reading else 0.0,
             actor=f"extractor:{result.extraction_source}",
+            extra_checks=[check],
         )
     changes = verify_profile(session, profile_id, confidence_cutoff=confidence_cutoff)
     return document, result, changes
@@ -198,6 +210,7 @@ def profile_observations(session: Session, profile_id: str) -> list[Observation]
             verification_status=f.verification_status,
             officer_reviewed=f.reviewed_by is not None,
             problem=f.problem,
+            low_quality_image=f.low_quality_image,
         )
         for f in facts
     ]

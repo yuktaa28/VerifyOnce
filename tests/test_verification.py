@@ -7,6 +7,7 @@ from datetime import date
 import pytest
 from sqlalchemy import select
 
+from backend.image_quality import LOW_QUALITY_REASON, quality_check
 from backend.models import AuditEvent
 from backend.service import add_document, add_fact, create_profile, set_fact_status
 from backend.verification import validate, verify_profile
@@ -131,6 +132,18 @@ def test_confidence_below_cutoff_flags_the_fact(bare_session):
     assert fact.verification_status == "flagged"
     assert fact.value_json == 81.0  # the value is kept; only the status says it needs a look
     assert "Confidence 0.62 is below the 0.80 cutoff" in [c["message"] for c in fact.checks]
+
+
+def test_low_quality_image_flags_a_confident_fact_and_survives_reverification(bare_session):
+    profile = create_profile(bare_session, "p1", actor="test")
+    document = add_document(bare_session, profile, "marksheet", actor="test")
+    fact = add_fact(bare_session, document, "marks_percent", 81, 1.0, actor="test",
+                    extra_checks=[quality_check(False)])
+    for _ in range(2):  # re-verification keeps the image-quality check
+        verify_profile(bare_session, "p1", confidence_cutoff=0.85)
+        assert fact.verification_status == "flagged"
+        assert [c["message"] for c in fact.checks if not c["passed"]] == [LOW_QUALITY_REASON]
+    assert fact.value_json == 81.0 and fact.low_quality_image
 
 
 def test_name_conflict_flags_both_documents(bare_session):

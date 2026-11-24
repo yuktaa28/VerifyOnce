@@ -48,8 +48,10 @@ def test_upload_returns_normalized_facts_checks_and_status(upload_client, fake_g
     income = facts["annual_income_inr"]
     assert (income["value"], income["confidence"], income["verification_status"]) == (240000, 0.93, "verified")
     assert {c["name"]: c["passed"] for c in income["checks"]} == {
-        "readable": True, "non_negative_integer": True, "confidence": True,
+        "readable": True, "non_negative_integer": True, "image_quality": True, "confidence": True,
     }
+    assert body["image_quality"]["ok"] is True
+    assert set(body["image_quality"]) == {"sharpness", "contrast", "min_sharpness", "min_contrast", "ok"}
     assert any(c["name"] == "cross_document" for c in facts["name"]["checks"])
 
 
@@ -77,6 +79,87 @@ def test_uploaded_facts_match_seeded_facts(upload_client, fake_gemini, seeded_cl
         )
 
     assert facts(upload_client, "uploaded") == facts(seeded_client, case)
+
+
+# --- The live failure: blurry marksheet misread as DOB 2004-05-30 at confidence 0.8 --------
+
+
+def reasons(decision) -> set[tuple[str, str]]:
+    return {(r["field"], r["issue"]) for r in decision["review_reasons"]}
+
+
+def failed_checks(fact) -> list[str]:
+    return [c["message"] for c in fact["checks"] if not c["passed"]]
+
+
+def test_blurry_marksheet_with_a_misread_birth_year_goes_to_review(upload_client, fake_gemini):
+    """Full profile through the real flow, with the reply the live model actually gave."""
+    case = "seed-low-confidence"
+    pairs = teach_case(fake_gemini, case)  # identity card and income certificate read correctly
+    sheet_path, _doc = manifest_doc(case, "marksheet")
+    fake_gemini.replies[sha256_of(sheet_path)] = json.dumps({
+        "name": {"value": "Kavya Nair", "confidence": 0.8},
+        "date_of_birth": {"value": "2004-05-30", "confidence": 0.8},  # seed: 2006-05-30
+        "marks_percent": {"value": 81, "confidence": 0.8},
+    })
+    bodies = {document_type: upload(upload_client, "p-live", path, document_type).json()
+              for path, document_type in pairs}
+
+    card, sheet = bodies["identity_card"], bodies["marksheet"]
+    assert card["image_quality"]["ok"] is True
+    assert sheet["image_quality"]["ok"] is False and sheet["status"] == "flagged"
+    sheet_facts = {f["field"]: f for f in sheet["facts"]}
+    # 1. The image-quality check flags every fact from the blurry marksheet.
+    for fact in sheet_facts.values():
+        assert fact["verification_status"] == "flagged"
+        assert "Image is blurry or low-contrast; needs human review" in failed_checks(fact)
+    # 2. 0.8 is below the 0.85 cutoff.
+    assert "Confidence 0.80 is below the 0.85 cutoff" in failed_checks(sheet_facts["date_of_birth"])
+    # 3. The wrong birth year conflicts with the identity card, which is flagged too.
+    assert "Date of birth differs from '2006-05-30' on the identity card" in failed_checks(
+        sheet_facts["date_of_birth"])
+    card_dob = next(f for f in card["facts"] if f["field"] == "date_of_birth")
+    assert (card_dob["fact_id"], "verified", "flagged") in {
+        (c["fact_id"], c["from"], c["to"]) for c in sheet["other_facts_changed"]}
+
+    scholarship = apply(upload_client, "p-live", SCHOLARSHIP)
+    waiver = apply(upload_client, "p-live", FEE_WAIVER)
+    assert scholarship["verdict"] == waiver["verdict"] == "needs_human_review"
+    assert {("marks_percent", "low_quality_image"), ("date_of_birth", "conflict")} <= reasons(scholarship)
+    assert reasons(waiver) == {("date_of_birth", "conflict")}  # the waiver needs no marks, only identity
+    profile = upload_client.get("/profiles/p-live").json()
+    wrong = [f for d in profile["documents"] for f in d["facts"] if f["value"] == "2004-05-30"]
+    assert [f["verification_status"] for f in wrong] == ["flagged"]  # never verified
+
+
+def test_image_quality_alone_sends_a_confident_blurry_reading_to_review(upload_client, fake_gemini):
+    """The model reads the blurry marksheet correctly and claims full confidence."""
+    case = "seed-low-confidence"
+    pairs = teach_case(fake_gemini, case)
+    sheet_path, doc = manifest_doc(case, "marksheet")
+    fake_gemini.replies[sha256_of(sheet_path)] = faithful_reply(
+        doc, **{field: {"value": value, "confidence": 1.0} for field, value in doc["expected"].items()})
+    for path, document_type in pairs:
+        upload(upload_client, "p-sure", path, document_type)
+    scholarship = apply(upload_client, "p-sure", SCHOLARSHIP)
+    assert scholarship["verdict"] == "needs_human_review"
+    assert reasons(scholarship) == {("marks_percent", "low_quality_image")}
+    assert apply(upload_client, "p-sure", FEE_WAIVER)["verdict"] == "approve"  # name and DOB corroborated
+
+
+def test_birth_date_conflict_alone_sends_a_clean_profile_to_review(upload_client, fake_gemini):
+    """All images are clean, but the model misreads the marksheet's birth year with confidence."""
+    case = "seed-below-marks"
+    pairs = teach_case(fake_gemini, case)
+    sheet_path, doc = manifest_doc(case, "marksheet")
+    fake_gemini.replies[sha256_of(sheet_path)] = faithful_reply(
+        doc, date_of_birth={"value": "2004-07-21", "confidence": 0.95})
+    for path, document_type in pairs:
+        assert upload(upload_client, "p-dob", path, document_type).json()["image_quality"]["ok"] is True
+    for scheme_id in (SCHOLARSHIP, FEE_WAIVER):
+        decision = apply(upload_client, "p-dob", scheme_id)
+        assert decision["verdict"] == "needs_human_review"
+        assert reasons(decision) == {("date_of_birth", "conflict")}
 
 
 def test_failed_extraction_flags_every_field_and_routes_to_review(upload_client, fake_gemini):

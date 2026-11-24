@@ -2,7 +2,7 @@
 # The file name must match the scheme id.
 id: state_student_scholarship
 name: State Student Scholarship
-ruleset_version: "2026.1"
+ruleset_version: "2026.2"
 description: >-
   Annual scholarship for students from lower-income families who scored at
   least 60% in their last qualifying exam.
@@ -11,6 +11,7 @@ description: >-
 # documents before any eligibility rule can decide the application.
 required_fields:
   - name
+  - date_of_birth
   - id_last4
 
 rules:

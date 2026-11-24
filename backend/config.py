@@ -14,9 +14,10 @@ from dotenv import load_dotenv
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = REPO_ROOT / "data" / "verifyonce.db"
 DEFAULT_CACHE_DIR = REPO_ROOT / "data" / "cache"
-DEFAULT_CONFIDENCE_CUTOFF = 0.80
+# Models report coarse confidences (0.8, 0.9, 1.0), so 0.8 must not pass: the cutoff is 0.85.
+DEFAULT_CONFIDENCE_CUTOFF = 0.85
 DEFAULT_EXTRACTION_PROVIDER = "gemini"
-DEFAULT_GEMINI_MODEL = "gemini-3.8-flash"
+DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5-5"
 EXTRACTION_PROVIDERS = ("gemini", "anthropic")
 

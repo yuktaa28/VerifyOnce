@@ -87,6 +87,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
                     "document_type": doc.document_type,
                     "source": doc.source,
                     "filename": doc.filename,
+                    "image_quality": doc.image_quality,
                     "extraction": {
                         "status": doc.extraction_status,
                         "source": doc.extraction_source,
@@ -132,6 +133,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             "filename": document.filename,
             "sha256": document.sha256,
             "status": _document_status(facts, result.ok),
+            "image_quality": document.image_quality,
             "extraction": {
                 "extraction_source": result.extraction_source,
                 "status": result.status,

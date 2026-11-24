@@ -4,7 +4,7 @@ Verdict precedence (the first matching step wins):
 
 1. ``needs_human_review``: evidence for a field the scheme needs is missing,
    unreadable or invalid on some document, below the confidence cutoff (default
-   0.80), or conflicts across documents.
+   0.85), only read from a blurry or low-contrast image, or conflicts across documents.
 2. ``reject``: the evidence is reliable and at least one eligibility rule fails.
 3. ``approve``: the evidence is reliable and every rule passes.
 
@@ -20,6 +20,11 @@ Evidence rules, per field:
   verification does not change confidence.)
 * An observation with no value (unreadable, or it failed a validator) makes the field
   ``invalid``: the document cannot be checked against the others.
+* An observation from a document whose image failed the deterministic quality check
+  (blurry or low-contrast) is not trusted on its own, whatever confidence the model
+  gave it. If a field's only readable evidence comes from such documents, the field is
+  ``low_quality_image``. A matching reading from a good document covers it, and
+  disagreements still count as conflicts.
 * The field is low-confidence when its best readable observation is below the cutoff.
   A value exactly at the cutoff is accepted, and a low-confidence reading that agrees
   with a confident one is covered by it.
@@ -50,6 +55,7 @@ UNRESOLVED = "unresolved"
 
 MISSING = "missing"
 INVALID = "invalid"
+LOW_QUALITY_IMAGE = "low_quality_image"
 LOW_CONFIDENCE = "low_confidence"
 CONFLICT = "conflict"
 
@@ -67,12 +73,20 @@ class Observation:
     verification_status: str = "unverified"
     officer_reviewed: bool = False
     problem: str | None = None  # why value is None (unreadable / failed validator)
+    low_quality_image: bool = False  # the document image failed the quality check
+
+    @property
+    def officer_verified(self) -> bool:
+        return self.verification_status == "verified" and self.officer_reviewed
 
     @property
     def effective_confidence(self) -> float:
-        if self.verification_status == "verified" and self.officer_reviewed:
-            return 1.0
-        return self.confidence
+        return 1.0 if self.officer_verified else self.confidence
+
+    @property
+    def trusted(self) -> bool:
+        """Readable and from a good image (or confirmed by an officer)."""
+        return self.value is not None and (not self.low_quality_image or self.officer_verified)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -84,6 +98,7 @@ class Observation:
             "confidence": self.confidence,
             "verification_status": self.verification_status,
             "problem": self.problem,
+            "low_quality_image": self.low_quality_image,
         }
 
 
@@ -104,9 +119,16 @@ class FieldEvidence:
         return [o for o in self.observations if o.value is None]
 
     @property
-    def best_confidence(self) -> float | None:
+    def best(self) -> Observation | None:
+        """The observation whose value is used: the best trusted one, else the best readable one."""
+        trusted = [o for o in self.observations if o.trusted]
         readable = self.readable
-        return readable[0].effective_confidence if readable else None
+        return (trusted or readable or [None])[0]
+
+    @property
+    def best_confidence(self) -> float | None:
+        best = self.best
+        return best.effective_confidence if best else None
 
     @property
     def fact_ids(self) -> list[int]:
@@ -180,7 +202,10 @@ def resolve_field(field_name: str, observations: list[Observation], cutoff: floa
     readable = evidence.readable
     if not readable:
         return evidence
-    evidence.value = readable[0].value
+    best = evidence.best
+    evidence.value = best.value
+    if not best.trusted:
+        evidence.issues.append(LOW_QUALITY_IMAGE)
     # Group observations that all agree with each other; more than one group is a conflict.
     for obs in readable:
         for group in evidence.groups:
@@ -191,7 +216,7 @@ def resolve_field(field_name: str, observations: list[Observation], cutoff: floa
             evidence.groups.append([obs])
     if len(evidence.groups) > 1:
         evidence.issues.append(CONFLICT)
-    if readable[0].effective_confidence < cutoff:
+    if best.effective_confidence < cutoff:
         evidence.issues.append(LOW_CONFIDENCE)
     return evidence
 
@@ -337,8 +362,11 @@ def _issue_message(ev: FieldEvidence, issue: str, cutoff: float) -> str:
             for o in ev.unreadable
         ]
         return f"{label} could not be used " + "; ".join(parts)
+    if issue == LOW_QUALITY_IMAGE:
+        docs = ", ".join(sorted({document_label(o.document_type) for o in ev.readable if o.low_quality_image}))
+        return f"{label} comes only from the {docs}, whose image is blurry or low-contrast; needs human review"
     if issue == LOW_CONFIDENCE:
-        best = ev.readable[0]
+        best = ev.best
         return (
             f"{label} was read with low confidence ({best.effective_confidence:.0%}, below the "
             f"{cutoff:.0%} cutoff) from the {document_label(best.document_type)}"

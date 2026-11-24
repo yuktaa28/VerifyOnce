@@ -13,6 +13,7 @@ from backend.evaluator import (
     FAIL,
     INVALID,
     LOW_CONFIDENCE,
+    LOW_QUALITY_IMAGE,
     MISSING,
     NEEDS_HUMAN_REVIEW,
     PASS,
@@ -27,16 +28,18 @@ SCHOLARSHIP = "state_student_scholarship"
 _ids = itertools.count(1)
 
 
-def obs(field, value, confidence=0.95, doc="identity_card", status="unverified", officer=False, problem=None):
+def obs(field, value, confidence=0.95, doc="identity_card", status="unverified", officer=False, problem=None,
+        low_quality=False):
     return Observation(
         field, value, confidence, fact_id=next(_ids), document_type=doc, verification_status=status,
-        officer_reviewed=officer, problem=problem,
+        officer_reviewed=officer, problem=problem, low_quality_image=low_quality,
     )
 
 
 def profile(*, income=240_000, marks=78.5, income_conf=0.95, second_name="Ravi Patil", extra=()):
     return [
         obs("name", "Ravi K. Patil"),
+        obs("date_of_birth", date(2006, 3, 14)),
         obs("id_last4", "2051"),
         obs("name", second_name, doc="income_certificate"),
         obs("annual_income_inr", income, income_conf, doc="income_certificate"),
@@ -128,11 +131,17 @@ def test_confidence_below_cutoff_needs_review(schemes):
     result = evaluate(schemes[SCHOLARSHIP], profile(income_conf=0.79))
     assert result.verdict == NEEDS_HUMAN_REVIEW
     assert [(r.field, r.issue) for r in result.review_reasons] == [("annual_income_inr", LOW_CONFIDENCE)]
-    assert "79%, below the 80% cutoff" in result.reason
+    assert "79%, below the 85% cutoff" in result.reason
+
+
+def test_default_cutoff_rejects_a_coarse_point_eight(schemes):
+    """Models report coarse values like 0.8; that must not count as confident."""
+    assert evaluate(schemes[SCHOLARSHIP], profile(income_conf=0.80)).verdict == NEEDS_HUMAN_REVIEW
+    assert evaluate(schemes[SCHOLARSHIP], profile(income_conf=0.90)).verdict == APPROVE
 
 
 def test_confidence_exactly_at_cutoff_is_accepted(schemes):
-    assert evaluate(schemes[SCHOLARSHIP], profile(income_conf=0.80)).verdict == APPROVE
+    assert evaluate(schemes[SCHOLARSHIP], profile(income_conf=0.85)).verdict == APPROVE
 
 
 def test_cutoff_is_configurable(schemes):
@@ -145,6 +154,46 @@ def test_cutoff_is_configurable(schemes):
 def test_high_confidence_copy_covers_a_low_confidence_one(schemes):
     extra = (obs("annual_income_inr", 240_000, 0.97, doc="bank_statement"),)
     assert evaluate(schemes[SCHOLARSHIP], profile(income_conf=0.40, extra=extra)).verdict == APPROVE
+
+
+# --- Low-quality images -------------------------------------------------------------------
+
+
+def blurry_marksheet_profile(*, marks_conf=1.0, dob=date(2006, 3, 14), officer=False):
+    """Every marksheet reading comes from a blurry image, however confident the model was."""
+    return [
+        o for o in profile() if o.document_type != "marksheet"
+    ] + [
+        obs("name", "Ravi Patil", 1.0, doc="marksheet", low_quality=True),
+        obs("date_of_birth", dob, 1.0, doc="marksheet", low_quality=True),
+        obs("marks_percent", 78.5, marks_conf, doc="marksheet", low_quality=True,
+            status="verified" if officer else "flagged", officer=officer),
+    ]
+
+
+def test_field_read_only_from_a_blurry_image_needs_review_even_at_full_confidence(schemes):
+    result = evaluate(schemes[SCHOLARSHIP], blurry_marksheet_profile(marks_conf=1.0))
+    assert result.verdict == NEEDS_HUMAN_REVIEW
+    assert [(r.field, r.issue) for r in result.review_reasons] == [("marks_percent", LOW_QUALITY_IMAGE)]
+    assert ("marks percentage comes only from the marksheet, whose image is blurry or low-contrast; "
+            "needs human review") in result.reason
+
+
+def test_blurry_reading_that_agrees_with_a_good_document_is_covered(schemes):
+    # name and date of birth also come from the identity card, so only marks need review
+    result = evaluate(schemes[SCHOLARSHIP], blurry_marksheet_profile())
+    assert {r.field for r in result.review_reasons} == {"marks_percent"}
+    assert evaluate(schemes["income_based_fee_waiver"], blurry_marksheet_profile()).verdict == APPROVE
+
+
+def test_blurry_reading_that_disagrees_is_still_a_conflict(schemes):
+    result = evaluate(schemes["income_based_fee_waiver"], blurry_marksheet_profile(dob=date(2004, 3, 14)))
+    assert result.verdict == NEEDS_HUMAN_REVIEW
+    assert [(r.field, r.issue) for r in result.review_reasons] == [("date_of_birth", CONFLICT)]
+
+
+def test_officer_can_confirm_a_reading_from_a_blurry_image(schemes):
+    assert evaluate(schemes[SCHOLARSHIP], blurry_marksheet_profile(officer=True)).verdict == APPROVE
 
 
 def test_officer_verified_fact_counts_as_full_confidence(schemes):

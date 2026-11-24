@@ -93,9 +93,12 @@ def test_name_mismatch_reports_both_spellings(seeded_client):
 def test_low_confidence_names_the_field_and_score(seeded_client):
     body = submit(seeded_client, "seed-low-confidence", SCHOLARSHIP)
     assert body["verdict"] == "needs_human_review"
-    (reason,) = body["review_reasons"]
-    assert (reason["field"], reason["issue"]) == ("marks_percent", "low_confidence")
-    assert "62%, below the 80% cutoff" in body["reason"]
+    assert [(r["field"], r["issue"]) for r in body["review_reasons"]] == [
+        ("marks_percent", "low_quality_image"),
+        ("marks_percent", "low_confidence"),
+    ]
+    assert "blurry or low-contrast" in body["reason"]
+    assert "62%, below the 85% cutoff" in body["reason"]
     # The blurry marksheet's name agrees with the confident copies, so it does not block,
     # and the fee waiver (no marks rule) is offered instead.
     assert [s["scheme_id"] for s in body["possible_schemes"]] == [FEE_WAIVER]

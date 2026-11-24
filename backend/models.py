@@ -74,6 +74,7 @@ class Document(Base):
     extraction_source: Mapped[str | None] = mapped_column(String(10))  # live / cache
     extraction_model: Mapped[str | None] = mapped_column(String(100))
     extraction_error: Mapped[str | None] = mapped_column(Text)
+    image_quality: Mapped[dict[str, Any] | None] = mapped_column(JSON)  # measurements + ok
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     profile: Mapped[Profile] = relationship(back_populates="documents")
@@ -108,6 +109,11 @@ class Fact(Base):
         """Why the value is unusable (first failed validator), or None."""
         failed = [c for c in self.checks or [] if c.get("kind") == "validator" and not c.get("passed")]
         return failed[0]["message"] if failed else None
+
+    @property
+    def low_quality_image(self) -> bool:
+        """True when the document image failed the deterministic quality check."""
+        return any(c.get("kind") == "image_quality" and not c.get("passed") for c in self.checks or [])
 
 
 class Application(Base):

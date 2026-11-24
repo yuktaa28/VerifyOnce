@@ -32,12 +32,12 @@ Then edit `.env` and fill in your own values. `.env` is git-ignored: never commi
 |---|---|---|
 | `EXTRACTION_PROVIDER` | `gemini` | `gemini` (free tier) or `anthropic` (paid) |
 | `GEMINI_API_KEY` | (none) | Needed for live extraction with Gemini. A free key comes from Google AI Studio. Without it, every upload is flagged for review. |
-| `GEMINI_MODEL` | `gemini-3.8-flash` | Gemini model used to read documents. `python scripts/list_models.py` lists the ones your key can use. |
+| `GEMINI_MODEL` | `gemini-3.5-flash-lite` | Gemini model used to read documents. `python scripts/list_models.py` lists the ones your key can use. (`gemini-3.8-flash` was often overloaded, and `gemini-2.5-flash` is closed to new accounts.) |
 | `ANTHROPIC_API_KEY` | (none) | Only needed when `EXTRACTION_PROVIDER=anthropic` |
 | `ANTHROPIC_MODEL` | `claude-opus-5-5` | Model used when the provider is `anthropic` |
 | `EXTRACTION_USE_CACHE` | off | `1` reads cached results from `data/cache/` first; live is the default |
 | `VERIFY_ONCE_DB` | `data/verifyonce.db` | SQLite file path, or a full SQLAlchemy URL |
-| `VERIFY_ONCE_CONFIDENCE_CUTOFF` | `0.80` | Evidence below this confidence is flagged |
+| `VERIFY_ONCE_CONFIDENCE_CUTOFF` | `0.85` | Evidence below this confidence is flagged. Models report coarse values (0.8, 0.9, 1.0), so a bare 0.8 does not pass. |
 
 A shell variable overrides `.env`, for example `$env:EXTRACTION_USE_CACHE="1"`.
 
@@ -51,6 +51,8 @@ python scripts/run_seed_cases.py            # every seed profile x every scheme,
 python scripts/make_documents.py            # regenerate the synthetic documents
 python scripts/list_models.py               # Gemini models your key can use that accept images (names only)
 python scripts/live_check.py --injection    # real extraction of the clean, blurry and injection marksheets
+python scripts/live_check.py --profile seed-low-confidence   # all 3 documents of a case, cross-checks, verdicts
+python -m backend.image_quality             # sharpness and contrast of every synthetic document
 python -m pytest -m live --run-live -s      # opt-in tests against the real provider (3 API calls)
 ```
 
@@ -88,10 +90,15 @@ Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8000/profiles/demo-1/applic
 2. **Verification** (`backend/verification.py`). Each fact moves from `unverified` to `verified` or `flagged`. It is flagged when:
    - its value is null (model confidence is not calibrated, so a null is always flagged),
    - a validator fails (date of birth parses and is between 1900 and today; income is a non-negative whole number; marks are 0-100; `id_last4` is 4 digits),
-   - its confidence is below the cutoff,
+   - its confidence is below the cutoff (0.85),
+   - its document image failed the image-quality check (below),
    - or its name or date of birth disagrees with another document.
 
    Each new upload re-checks the whole profile, so a later document can flag an earlier fact. Facts an officer has reviewed keep the officer's status.
+3. **Image quality** (`backend/image_quality.py`). Every upload is measured directly, with no model involved: sharpness is the variance of a Laplacian filter (after light smoothing, so scanner grain doesn't count), and contrast is the standard deviation of the grey levels. Both are measured at a fixed 1000-pixel width.
+   - A document below either threshold (sharpness 35, contrast 15) is low quality. Every fact from it is flagged with "Image is blurry or low-contrast; needs human review", even if the model reported full confidence.
+   - The thresholds come from our 16 synthetic documents: the clean ones score 137-217 sharpness and 42-67 contrast; the blurry marksheet scores 8.3 and 4.7.
+   - Real phone photos may need the thresholds re-tuned.
 
 **Sampling.** Gemini is called with `temperature` 0. The Anthropic provider sends no `temperature`: the installed Anthropic SDK (2.x) uses API version 2026-10-21, which rejects `temperature`, `top_p` and `top_k` on every model.
 
@@ -110,6 +117,7 @@ Review wins over reject on purpose. A rejection based on a misread or mismatched
 Evidence rules:
 
 - A field's value comes from its highest-confidence readable observation. A value exactly at the cutoff is accepted, and a low-confidence copy that agrees with a confident one is covered by it.
+- A reading from a blurry or low-contrast image is never trusted on its own, whatever its confidence. A field whose only evidence comes from such images goes to review. A matching reading from a good document covers it, and a disagreeing one is still a conflict.
 - A fact an officer marked `verified` counts as full confidence. A fact marked `rejected` is ignored. Automatic verification never raises confidence.
 - Names match across case, spacing, punctuation, initials and word order ("Ravi K. Patil" = "Ravi Patil"). A different spelling is a real conflict ("Ishan Rao" vs "Ishan Rau").
 
@@ -120,7 +128,7 @@ Evidence rules:
 | State Student Scholarship | income ≤ ₹3,00,000 and marks ≥ 60% |
 | Income-Based Fee Waiver | income ≤ ₹4,50,000 |
 
-Both also require a consistent name and the last four digits of an ID. Rule operators: `gte`, `lte`, `eq`, `in`, `exists`. A new scheme that uses the existing fields and operators needs only a new YAML file in `schemes/`, named after its id.
+Both also require consistent identity evidence: name, date of birth and the last four digits of an ID (ruleset 2026.2 added date of birth). Rule operators: `gte`, `lte`, `eq`, `in`, `exists`. A new scheme that uses the existing fields and operators needs only a new YAML file in `schemes/`, named after its id.
 
 ### Records
 

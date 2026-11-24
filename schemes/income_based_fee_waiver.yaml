@@ -2,7 +2,7 @@
 # The file name must match the scheme id.
 id: income_based_fee_waiver
 name: Income-Based Fee Waiver
-ruleset_version: "2026.1"
+ruleset_version: "2026.2"
 description: >-
   Tuition fee waiver for students from families with an annual income of at
   most 450000 INR. There is no marks requirement.
@@ -11,6 +11,7 @@ description: >-
 # documents before any eligibility rule can decide the application.
 required_fields:
   - name
+  - date_of_birth
   - id_last4
 
 rules:

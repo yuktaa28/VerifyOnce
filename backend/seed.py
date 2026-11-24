@@ -17,6 +17,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from backend.config import DEFAULT_CONFIDENCE_CUTOFF
+from backend.image_quality import quality_check
 from backend.models import Profile
 from backend.service import add_document, add_fact, create_profile
 from backend.verification import verify_profile
@@ -167,6 +168,8 @@ SEED_PROFILES: tuple[SeedProfile, ...] = (
 def seed_database(session: Session, *, confidence_cutoff: float = DEFAULT_CONFIDENCE_CUTOFF) -> list[str]:
     """Insert any seed profile that is not in the database yet, then verify its facts.
 
+    A seed document's ``quality`` stands in for the image-quality measurement, so a
+    "blurry" seed document flags its facts exactly as the uploaded image does.
     Returns the ids created.
     """
     created = []
@@ -175,9 +178,12 @@ def seed_database(session: Session, *, confidence_cutoff: float = DEFAULT_CONFID
             continue
         profile = create_profile(session, seed.id, label=seed.label, actor=SEED_ACTOR)
         for doc in seed.documents:
-            document = add_document(session, profile, doc.document_type, actor=SEED_ACTOR, source="seed")
+            ok = doc.quality == "clean"
+            document = add_document(session, profile, doc.document_type, actor=SEED_ACTOR, source="seed",
+                                    image_quality={"source": "seed", "quality": doc.quality, "ok": ok})
+            check = quality_check(ok, "seed document marked clean")
             for field, (raw, confidence) in doc.facts.items():
-                add_fact(session, document, field, raw, confidence, actor=SEED_ACTOR)
+                add_fact(session, document, field, raw, confidence, actor=SEED_ACTOR, extra_checks=[check])
         verify_profile(session, profile.id, confidence_cutoff=confidence_cutoff, actor=SEED_ACTOR)
         created.append(seed.id)
     session.flush()

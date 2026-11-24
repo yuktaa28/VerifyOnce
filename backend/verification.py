@@ -6,8 +6,11 @@ A fact is flagged when any of these hold, otherwise it is verified:
   always flagged, whatever confidence came with it;
 * a validator fails (date of birth must parse and be plausible, income must be a
   non-negative whole number, marks must be 0-100, id_last4 must be 4 digits);
-* its confidence is below the cutoff (default 0.80);
+* its confidence is below the cutoff (default 0.85, so a coarse 0.8 does not pass);
 * for name and date of birth, it disagrees with the same field on another document.
+
+* the document image failed the image-quality check (``backend.image_quality``):
+  blurry or low-contrast, so every fact read from it needs a person.
 
 A failed validator leaves the stored value empty, so a bad reading can never reach
 the evaluator. Facts an officer has reviewed (``reviewed_by`` set) keep the officer's
@@ -31,6 +34,8 @@ from backend.models import AuditEvent, Document, Fact
 VALIDATOR = "validator"
 CONFIDENCE = "confidence"
 CROSS_DOCUMENT = "cross_document"
+IMAGE_QUALITY = "image_quality"
+STATIC_CHECK_KINDS = (VALIDATOR, IMAGE_QUALITY)  # fixed when the fact is stored; never recomputed
 CROSS_CHECKED_FIELDS = ("name", "date_of_birth")
 EARLIEST_BIRTH_DATE = date(1900, 1, 1)
 
@@ -191,7 +196,7 @@ def verify_profile(
     for fact in facts:
         if fact.reviewed_by is not None:
             continue  # an officer decided this fact
-        checks = [c for c in fact.checks or [] if c.get("kind") == VALIDATOR]
+        checks = [c for c in fact.checks or [] if c.get("kind") in STATIC_CHECK_KINDS]
         checks.append(confidence_check(fact.confidence, confidence_cutoff).as_dict())
         if fact.field in CROSS_CHECKED_FIELDS and fact.value_json is not None:
             others = [o for o in comparable if o.field == fact.field and o.document_id != fact.document_id]
