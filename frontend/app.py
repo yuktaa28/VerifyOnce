@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import logging  # noqa: E402
+
 import streamlit as st  # noqa: E402
 
 st.set_page_config(page_title="VerifyOnce", page_icon="🪪", layout="wide")
@@ -33,4 +35,9 @@ navigation = st.navigation({
         st.Page("pages/officer_case.py", title="Case view", icon="🔎"),
     ],
 })
-navigation.run()
+try:
+    navigation.run()
+except Exception:  # st.stop / st.rerun derive from BaseException and pass through
+    logging.getLogger("verifyonce.ui").exception("Page error")
+    st.error("Something went wrong on this page. Try again; if it keeps happening, check the API window. "
+             "(Details are in the Streamlit console, never shown here.)")

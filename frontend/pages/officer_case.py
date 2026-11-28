@@ -50,6 +50,7 @@ else:
 ui.show_verdict(decision["verdict"], decision["reason"])
 st.caption(f"Decision {decision['sequence']} on this application (id {decision['decision_id']}) · decided by "
            f"{decision['decided_by']} · ruleset {decision['ruleset_version']}")
+ui.show_explanation(decision, officer=True)
 
 st.markdown("#### Rule outcomes")
 ui.rule_table(decision["rule_outcomes"])

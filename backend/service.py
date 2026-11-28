@@ -252,6 +252,7 @@ def submit_application(
     *,
     actor: str,
     confidence_cutoff: float,
+    explainer: Any = None,
 ) -> tuple[Decision, AuditEvent]:
     """Evaluate a scheme for a profile and store the result as a new, immutable Decision."""
     if session.get(Profile, profile_id) is None:
@@ -291,7 +292,7 @@ def submit_application(
     return record_decision(
         session, application, scheme, result, confidence_cutoff=confidence_cutoff,
         decided_by="evaluator", actor=actor,
-        action="decision.resubmitted" if previous else "decision.created",
+        action="decision.resubmitted" if previous else "decision.created", explainer=explainer,
     )
 
 
@@ -337,15 +338,20 @@ def record_decision(
     reason: str | None = None,
     fact_id: int | None = None,
     details: dict[str, Any] | None = None,
+    explainer: Any = None,
 ) -> tuple[Decision, AuditEvent]:
     """Store a new immutable Decision that supersedes the latest one, plus its AuditEvent.
 
     ``result`` is an EvaluationResult: its rule outcomes and evidence snapshot are kept
     even when an officer sets a different verdict. The audit event links the new
     decision, the one it supersedes, and the application's original decision.
+    With an enabled ``explainer``, a plain-language explanation of the final verdict is
+    stored on the decision as it is recorded (decisions are never updated afterwards).
     """
     previous = latest_decision(session, application.id)
     first = original_decision(session, application.id)
+    final_verdict = verdict or result.verdict
+    explanation = explainer.explain(scheme, final_verdict, result, decided_by=decided_by) if explainer else None
     decision = Decision(
         application_id=application.id,
         sequence=(previous.sequence + 1) if previous else 1,
@@ -353,9 +359,12 @@ def record_decision(
         scheme_id=scheme.id,
         ruleset_version=scheme.ruleset_version,
         confidence_cutoff=confidence_cutoff,
-        verdict=verdict or result.verdict,
+        verdict=final_verdict,
         reason=reason or result.reason,
-        explanation=None,
+        explanation=explanation.citizen if explanation else None,
+        officer_brief=explanation.officer_brief if explanation else None,
+        explanation_source=explanation.source if explanation else None,
+        explanation_model=explanation.model if explanation else None,
         rule_outcomes=result.rule_outcomes_json(),
         evaluated_values=result.evaluated_values,
         source_facts=result.source_facts,
@@ -459,6 +468,9 @@ def decision_payload(
         "verdict": decision.verdict,
         "reason": decision.reason,
         "explanation": decision.explanation,
+        "officer_brief": decision.officer_brief,
+        "explanation_source": decision.explanation_source,
+        "explanation_model": decision.explanation_model,
         "confidence_cutoff": decision.confidence_cutoff,
         "rule_outcomes": outcomes,
         "source_facts": decision.source_facts,

@@ -101,8 +101,10 @@ def test_low_confidence_names_the_field_and_score(seeded_client):
     assert "marks percentage was read from the marksheet with confidence 62%, below the 85% cutoff" in body["reason"]
     assert "read at" not in body["reason"]
     # The blurry marksheet's name agrees with the confident copies, so it does not block,
-    # and the fee waiver (no marks rule) is offered instead.
-    assert [s["scheme_id"] for s in body["possible_schemes"]] == [FEE_WAIVER]
+    # and the fee waiver (no marks rule) is offered first as an approval. The Merit Book
+    # Grant (marks >= 75) is offered as possible but needing review: marks come only from the scan.
+    assert [(s["scheme_id"], s["predicted_verdict"]) for s in body["possible_schemes"]] == [
+        (FEE_WAIVER, "approve"), ("merit_book_grant", "needs_human_review")]
 
 
 def test_seed_facts_move_to_verified_or_flagged(seeded_client):

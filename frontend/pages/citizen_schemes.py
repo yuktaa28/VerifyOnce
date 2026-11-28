@@ -29,6 +29,7 @@ def apply_for(scheme_id: str) -> None:
 
 def show_decision(decision: dict) -> None:
     ui.show_verdict(decision["verdict"], decision["reason"])
+    ui.show_explanation(decision)
     if decision.get("review_reasons"):
         st.markdown("**What an officer will check**")
         for reason in decision["review_reasons"]:

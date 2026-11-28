@@ -252,6 +252,19 @@ class GeminiProvider:
             temperature=0,
         )
         contents = [genai_types.Part.from_bytes(data=request.image, mime_type=request.media_type), *request.texts]
+        return self._generate(contents, config)
+
+    def generate_text(self, *, system: str, prompt: str, schema: dict[str, Any]) -> ModelReply:
+        """A text-only call returning JSON for ``schema`` (used for optional explanations)."""
+        config = genai_types.GenerateContentConfig(
+            system_instruction=system,
+            response_mime_type="application/json",
+            response_json_schema=schema,
+            temperature=0,
+        )
+        return self._generate([prompt], config)
+
+    def _generate(self, contents: list[Any], config: Any) -> ModelReply:
         try:
             response = self._get_client().models.generate_content(model=self.model, contents=contents, config=config)
         except genai_errors.APIError as exc:
@@ -409,6 +422,46 @@ def _parse_reply(document_type: str, text: str) -> BaseModel:
     return DOCUMENT_SCHEMAS[document_type].model_validate_json(stripped)
 
 
+def _readings_match_raw(document_type: str, readings: dict[str, Any], raw: str) -> bool:
+    """True when ``readings`` are exactly what the model's raw reply says."""
+    try:
+        parsed = _parse_reply(document_type, raw)
+    except ValidationError:
+        return False
+    return {name: reading.model_dump() for name, reading in parsed} == readings
+
+
+def call_with_retries(
+    call: Callable[[], ModelReply],
+    *,
+    provider_name: str,
+    label: str,
+    delays: tuple[float, ...] = RETRY_DELAYS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[ModelReply | None, int, ProviderError | None]:
+    """Run a provider call, retrying transient errors (429, 5xx, timeouts) with backoff.
+
+    Returns (reply, calls made, final error). Non-transient errors are not retried.
+    """
+    max_attempts = len(delays) + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return call(), attempt, None
+        except ProviderError as exc:
+            if not exc.transient:
+                return None, attempt, exc
+            if attempt == max_attempts:
+                return None, attempt, ProviderError(
+                    f"{str(exc).rstrip('.')}. Gave up after {max_attempts} attempts.",
+                    quota=exc.quota, transient=True,
+                )
+            delay = delays[attempt - 1]
+            log.warning("%s call for %s failed: %s. Retrying in %.0fs (attempt %d of %d).",
+                        provider_name, label, str(exc).rstrip("."), delay, attempt + 1, max_attempts)
+            sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def _short_errors(exc: ValidationError) -> str:
     parts = []
     for err in exc.errors()[:5]:
@@ -476,7 +529,7 @@ class Extractor:
                 return cached
         result = self._extract_live(content, document_type, sha256)
         if result.ok:
-            self._write_cache(result)
+            self.save_to_cache(result)
         else:
             log.warning("Extraction failed for %s %s (%s): %s. Sent to officer review.",
                         document_type, sha256[:12], self.provider.name, (result.error or "").rstrip("."))
@@ -484,23 +537,37 @@ class Extractor:
 
     def _generate_with_retries(self, request: ModelRequest, label: str) -> tuple[ModelReply | None, int, ProviderError | None]:
         """Call the provider, retrying transient errors. Returns (reply, calls made, final error)."""
-        max_attempts = len(self.retry_delays) + 1
-        for attempt in range(1, max_attempts + 1):
-            try:
-                return self.provider.generate(request), attempt, None
-            except ProviderError as exc:
-                if not exc.transient:
-                    return None, attempt, exc
-                if attempt == max_attempts:
-                    return None, attempt, ProviderError(
-                        f"{str(exc).rstrip('.')}. Gave up after {max_attempts} attempts.",
-                        quota=exc.quota, transient=True,
-                    )
-                delay = self.retry_delays[attempt - 1]
-                log.warning("%s call for %s failed: %s. Retrying in %.0fs (attempt %d of %d).",
-                            self.provider.name, label, str(exc).rstrip("."), delay, attempt + 1, max_attempts)
-                self._sleep(delay)
-        raise AssertionError("unreachable")  # pragma: no cover
+        return call_with_retries(lambda: self.provider.generate(request), provider_name=self.provider.name,
+                                 label=label, delays=self.retry_delays, sleep=self._sleep)
+
+    # -- cache provenance --------------------------------------------------------------------
+
+    def extract_live_only(self, content: bytes, document_type: str) -> ExtractionResult:
+        """One real model call (with the usual retries), ignoring the cache and not writing it."""
+        if document_type not in DOCUMENT_SCHEMAS:
+            raise ExtractionError(f"Unknown document type {document_type!r}")
+        result = self._extract_live(content, document_type, hashlib.sha256(content).hexdigest())
+        if not result.ok:
+            log.warning("Extraction failed for %s (%s): %s", document_type, self.provider.name,
+                        (result.error or "").rstrip("."))
+        return result
+
+    def is_cached(self, content: bytes, document_type: str) -> bool:
+        """True when a usable cache entry from a real run exists for this file, provider and model."""
+        return self._read_cache(hashlib.sha256(content).hexdigest(), document_type) is not None
+
+    def save_to_cache(self, result: ExtractionResult) -> bool:
+        """Write a result to the cache only if it came from a real model call. Returns True if written.
+
+        Refuses anything else: results that are not live and successful, that made no
+        model call, or whose readings do not match what the model actually replied.
+        """
+        if result.extraction_source != "live" or not result.ok or result.attempts < 1 or not result.raw_responses:
+            return False
+        if not _readings_match_raw(result.document_type, result.readings, result.raw_responses[-1]):
+            return False
+        self._write_cache(result)
+        return True
 
     # -- live ------------------------------------------------------------------------------
 
@@ -576,11 +643,15 @@ class Extractor:
             readings = DOCUMENT_SCHEMAS[document_type].model_validate(data["readings"])
         except (KeyError, ValidationError):
             return None
+        readings_dict = {name: r.model_dump() for name, r in readings}
+        raw_responses = list(data.get("raw_responses", []))
+        # Only trust an entry whose values are exactly what the model replied (no hand edits).
+        if not raw_responses or not _readings_match_raw(document_type, readings_dict, raw_responses[-1]):
+            return None
         return ExtractionResult(
             document_type=document_type, sha256=sha256, extraction_source="cache", status="ok",
             provider=self.provider.name, model=data.get("served_model"),
-            readings={name: r.model_dump() for name, r in readings},
-            raw_responses=list(data.get("raw_responses", [])), attempts=0,
+            readings=readings_dict, raw_responses=raw_responses, attempts=0,
         )
 
     def _write_cache(self, result: ExtractionResult) -> None:

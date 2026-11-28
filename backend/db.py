@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sqlalchemy import Engine, create_engine, event
+from sqlalchemy import Engine, create_engine, event, inspect
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 
@@ -38,3 +38,24 @@ def init_db(engine: Engine) -> None:
     from backend import models  # noqa: F401  (registers the tables on Base.metadata)
 
     Base.metadata.create_all(engine)
+
+
+def schema_problems(engine: Engine) -> list[str]:
+    """Tables or columns the code expects but the database lacks (an older database).
+
+    There are no migrations: an out-of-date demo database is rebuilt with
+    scripts/demo_reset.py.
+    """
+    from backend import models  # noqa: F401
+
+    inspector = inspect(engine)
+    problems = []
+    for table in Base.metadata.sorted_tables:
+        if not inspector.has_table(table.name):
+            problems.append(f"missing table {table.name}")
+            continue
+        present = {c["name"] for c in inspector.get_columns(table.name)}
+        missing = [c.name for c in table.columns if c.name not in present]
+        if missing:
+            problems.append(f"{table.name} lacks {', '.join(missing)}")
+    return problems

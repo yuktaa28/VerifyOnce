@@ -1,0 +1,7 @@
+# Read when Streamlit is started from the VerifyOnce folder.
+[client]
+# Never show stack traces in the UI: users see a short message; details stay in the console.
+showErrorDetails = "none"
+
+[browser]
+gatherUsageStats = false

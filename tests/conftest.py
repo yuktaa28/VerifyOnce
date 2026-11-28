@@ -85,8 +85,10 @@ class FakeGemini:
 
     def _generate_content(self, *, model, contents, config):
         self.calls.append({"model": model, "contents": contents, "config": config})
-        sha = hashlib.sha256(contents[0].inline_data.data).hexdigest()
-        reply = _pick_reply(self.replies, self.default, sha, "FakeGemini")
+        first = contents[0]
+        # Image calls are keyed by the image's sha256; text-only calls (explanations) by "text".
+        key = hashlib.sha256(first.inline_data.data).hexdigest() if hasattr(first, "inline_data") else "text"
+        reply = _pick_reply(self.replies, self.default, key, "FakeGemini")
         if self.block_reason:
             return genai_types.GenerateContentResponse(
                 candidates=[],

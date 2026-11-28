@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -14,7 +15,8 @@ from sqlalchemy.orm import Session, selectinload
 from backend import officer, service
 from backend.api_models import ApplicationRequest, DecisionOut, EvidenceResolutionRequest, OfficerDecisionRequest
 from backend.config import Settings
-from backend.db import init_db, make_engine, make_session_factory
+from backend.db import init_db, make_engine, make_session_factory, schema_problems
+from backend.explanations import Explainer
 from backend.extraction import DOCUMENT_SCHEMAS, MAX_IMAGE_BYTES, Extractor, image_media_type
 from backend.image_quality import MIN_CONTRAST, MIN_SHARPNESS
 from backend.models import Application, AuditEvent, Document, Profile
@@ -33,11 +35,16 @@ def _document_status(facts: list[dict[str, Any]], extraction_ok: bool) -> str:
     return "flagged" if any(f["verification_status"] == "flagged" for f in facts) else "verified"
 
 
-def create_app(settings: Settings | None = None, *, extractor: Extractor | None = None) -> FastAPI:
+log = logging.getLogger("verifyonce.api")
+
+
+def create_app(settings: Settings | None = None, *, extractor: Extractor | None = None,
+               explainer: Explainer | None = None) -> FastAPI:
     settings = settings or Settings.from_env()
     engine = make_engine(settings.database_url)
     schemes = load_schemes(settings.schemes_dir)
     extractor = extractor or Extractor.from_settings(settings)
+    explainer = explainer or Explainer.from_settings(settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -57,14 +64,28 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
     app.state.session_factory = make_session_factory(engine)
     app.state.schemes = schemes
     app.state.extractor = extractor
+    app.state.explainer = explainer
+
+    @app.exception_handler(Exception)
+    async def unexpected_error(request: Request, exc: Exception) -> UTF8JSONResponse:
+        """Never send a stack trace to a client: log it here, return a plain message."""
+        log.exception("Unexpected error on %s %s", request.method, request.url.path)
+        return UTF8JSONResponse(status_code=500, content={
+            "detail": "Something went wrong on the server. Details are in the API window's log."})
 
     def get_session(request: Request) -> Iterator[Session]:
         with request.app.state.session_factory() as session:
             yield session
 
     @app.get("/health")
-    def health() -> dict[str, Any]:
-        return {"status": "ok", "schemes": list(schemes)}
+    def health(session: Session = Depends(get_session)) -> dict[str, Any]:
+        """Liveness plus a database check, for preflight checks and the UI."""
+        problems = schema_problems(engine)
+        if problems:
+            return {"status": "degraded", "database": "outdated schema: run scripts\\demo_reset.py",
+                    "problems": problems, "schemes": list(schemes)}
+        profiles = len(session.scalars(select(Profile.id)).all())
+        return {"status": "ok", "database": "ok", "profiles": profiles, "schemes": list(schemes)}
 
     @app.get("/status")
     def status() -> dict[str, Any]:
@@ -78,6 +99,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             "extraction_mode": "cache first" if ex.use_cache else "live",
             "confidence_cutoff": settings.confidence_cutoff,
             "image_quality_thresholds": {"min_sharpness": MIN_SHARPNESS, "min_contrast": MIN_CONTRAST},
+            "explanations_enabled": app.state.explainer.enabled,
             "schemes": list(schemes),
         }
 
@@ -181,7 +203,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         try:
             decision, audit = service.submit_application(
                 session, schemes, profile_id, body.scheme_id, actor=f"citizen:{profile_id}",
-                confidence_cutoff=cutoff,
+                confidence_cutoff=cutoff, explainer=app.state.explainer,
             )
         except service.ProfileNotFound:
             raise HTTPException(404, f"Profile {profile_id!r} not found") from None
@@ -281,7 +303,8 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         """
         result = _officer_errors(lambda: officer.resolve_evidence(
             session, schemes, application_id, fact_id=body.fact_id, resolution=body.resolution,
-            reason=body.reason, officer=body.officer, cutoff=settings.confidence_cutoff))
+            reason=body.reason, officer=body.officer, cutoff=settings.confidence_cutoff,
+            explainer=app.state.explainer))
         session.commit()
         return result
 
@@ -291,7 +314,8 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         """approve / reject / override. Approval is refused (409) while flagged evidence is unresolved."""
         decision, audit = _officer_errors(lambda: officer.officer_decide(
             session, schemes, application_id, action=body.action, verdict=body.verdict,
-            reason=body.reason, officer=body.officer, cutoff=settings.confidence_cutoff))
+            reason=body.reason, officer=body.officer, cutoff=settings.confidence_cutoff,
+            explainer=app.state.explainer))
         session.commit()
         return _decision_response(session, decision, audit)
 

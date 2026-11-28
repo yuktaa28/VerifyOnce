@@ -53,6 +53,7 @@ class Settings:
     anthropic_model: str = DEFAULT_ANTHROPIC_MODEL
     extraction_use_cache: bool = False
     cache_dir: Path = DEFAULT_CACHE_DIR
+    explanations_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence_cutoff <= 1.0:
@@ -87,4 +88,5 @@ class Settings:
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
             anthropic_model=os.environ.get("ANTHROPIC_MODEL") or DEFAULT_ANTHROPIC_MODEL,
             extraction_use_cache=_flag(os.environ.get("EXTRACTION_USE_CACHE")),
+            explanations_enabled=_flag(os.environ.get("EXPLANATIONS_ENABLED")),
         )

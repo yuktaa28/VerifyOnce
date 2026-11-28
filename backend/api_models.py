@@ -84,6 +84,9 @@ class DecisionOut(BaseModel):
     verdict: str
     reason: str
     explanation: str | None
+    officer_brief: str | None = None
+    explanation_source: str | None = None  # "generated" or "template"; never part of the verdict
+    explanation_model: str | None = None
     confidence_cutoff: float
     rule_outcomes: list[RuleOutcomeOut]
     source_facts: list[SourceFactOut]

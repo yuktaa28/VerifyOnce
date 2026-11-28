@@ -142,7 +142,11 @@ class Decision(Base):
     confidence_cutoff: Mapped[float] = mapped_column(Float)
     verdict: Mapped[str] = mapped_column(String(30))
     reason: Mapped[str] = mapped_column(Text)
+    # Optional plain-language text (EXPLANATIONS_ENABLED=1). Never part of the verdict.
     explanation: Mapped[str | None] = mapped_column(Text)
+    officer_brief: Mapped[str | None] = mapped_column(Text)
+    explanation_source: Mapped[str | None] = mapped_column(String(20))  # "generated" or "template"
+    explanation_model: Mapped[str | None] = mapped_column(String(100))
     rule_outcomes: Mapped[list[dict[str, Any]]] = mapped_column(JSON)
     evaluated_values: Mapped[dict[str, Any]] = mapped_column(JSON)
     source_facts: Mapped[list[dict[str, Any]]] = mapped_column(JSON)

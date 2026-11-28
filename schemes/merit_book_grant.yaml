@@ -1,0 +1,28 @@
+# Fictional scheme added with this YAML file only: no code changes.
+# The file name must match the scheme id.
+id: merit_book_grant
+name: Merit Book Grant
+ruleset_version: "2026.1"
+description: >-
+  A grant for textbooks for students who scored at least 75% and whose family
+  income is at most 500000 INR.
+
+# Identity evidence that must be present, confident and consistent across
+# documents before any eligibility rule can decide the application.
+required_fields:
+  - name
+  - date_of_birth
+  - id_last4
+
+rules:
+  - id: minimum_marks
+    field: marks_percent
+    op: gte
+    value: 75
+    description: Marks in the last qualifying exam must be at least 75%.
+
+  - id: income_limit
+    field: annual_income_inr
+    op: lte
+    value: 500000
+    description: Annual family income must be at most 500000 INR.

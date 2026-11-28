@@ -219,6 +219,7 @@ def resolve_evidence(
     reason: str | None,
     officer: str | None,
     cutoff: float,
+    explainer: Any = None,
 ) -> dict[str, Any]:
     """An officer confirms or rejects one fact, with a reason.
 
@@ -270,7 +271,7 @@ def resolve_evidence(
     session.add(event)
     session.flush()
     _reevaluate_automatic_applications(session, schemes, application.profile_id, actor=actor,
-                                       fact_id=fact.id, cutoff=cutoff)
+                                       fact_id=fact.id, cutoff=cutoff, explainer=explainer)
     blockers = _blockers(flags, result)
     return {
         "audit_event_id": event.id,
@@ -285,7 +286,8 @@ def resolve_evidence(
     }
 
 
-def _reevaluate_automatic_applications(session, schemes, profile_id, *, actor, fact_id, cutoff) -> None:
+def _reevaluate_automatic_applications(session, schemes, profile_id, *, actor, fact_id, cutoff,
+                                       explainer=None) -> None:
     """Refresh automatic approve/reject decisions whose evidence just changed."""
     for application in session.scalars(select(Application).where(Application.profile_id == profile_id)):
         scheme = schemes.get(application.scheme_id)
@@ -298,6 +300,7 @@ def _reevaluate_automatic_applications(session, schemes, profile_id, *, actor, f
         record_decision(
             session, application, scheme, result, confidence_cutoff=cutoff, decided_by="evaluator", actor=actor,
             action="decision.reevaluated", fact_id=fact_id, details={"trigger": "evidence_resolved"},
+            explainer=explainer,
         )
 
 
@@ -314,6 +317,7 @@ def officer_decide(
     officer: str | None,
     verdict: str | None = None,
     cutoff: float,
+    explainer: Any = None,
 ) -> tuple[Decision, AuditEvent]:
     """approve / reject / override: the officer's final decision, recorded as a new Decision."""
     if action not in OFFICER_ACTIONS:
@@ -347,6 +351,7 @@ def officer_decide(
         session, application, scheme, result, confidence_cutoff=cutoff, decided_by=f"officer:{officer}",
         actor=f"officer:{officer}", action=OFFICER_ACTIONS[action], verdict=final, reason=text,
         details={"officer_action": action, "officer_reason": note or None, "suggested_verdict": result.verdict},
+        explainer=explainer,
     )
 
 
