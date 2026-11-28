@@ -30,11 +30,13 @@ from backend.explanations import Explainer  # noqa: E402
 from backend.schemes import load_schemes  # noqa: E402
 
 NEXT_STEPS = r"""
-Next (two PowerShell windows, in the VerifyOnce folder):
+Next, in the VerifyOnce folder, start the website and API (http://127.0.0.1:8000):
+  .venv\Scripts\python.exe scripts\serve.py
+Then check everything before the demo (second window):
+  .venv\Scripts\python.exe scripts\preflight.py
+Streamlit fallback instead: run the API, then the UI (two windows):
   .venv\Scripts\python.exe -m uvicorn backend.main:app --port 8000
   .venv\Scripts\python.exe -m streamlit run frontend\app.py --server.port 8501
-Then check everything before the demo:
-  .venv\Scripts\python.exe scripts\preflight.py
 """
 
 

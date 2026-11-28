@@ -15,3 +15,7 @@ __pycache__/
 
 # Extraction cache
 data/cache/
+
+# Website build and packages (rebuilt with: cd web; npm install; npm run build)
+web/node_modules/
+web/dist/

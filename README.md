@@ -10,22 +10,25 @@ Built for Homingo Hackathon Edition 01, Automation track, problem statement B2: 
 2. [Architecture](#architecture)
 3. [Setup (Windows PowerShell)](#setup-windows-powershell)
 4. [Run the app](#run-the-app)
-5. [Demo day](#demo-day)
-6. [How a document becomes facts](#how-a-document-becomes-facts)
-7. [How decisions are made](#how-decisions-are-made)
-8. [Officer rules](#officer-rules)
-9. [Add a scheme](#add-a-scheme)
-10. [Optional explanations](#optional-explanations)
-11. [Scripts](#scripts)
-12. [API](#api)
-13. [Seed cases and documents](#seed-cases-and-documents)
-14. [Configuration](#configuration)
-15. [Tests](#tests)
-16. [Limitations and responsible use](#limitations-and-responsible-use)
+5. [Public demo safety](#public-demo-safety)
+6. [Demo day](#demo-day)
+7. [How a document becomes facts](#how-a-document-becomes-facts)
+8. [How decisions are made](#how-decisions-are-made)
+9. [Officer rules](#officer-rules)
+10. [Add a scheme](#add-a-scheme)
+11. [Optional explanations](#optional-explanations)
+12. [Scripts](#scripts)
+13. [API](#api)
+14. [Seed cases and documents](#seed-cases-and-documents)
+15. [Configuration](#configuration)
+16. [Tests](#tests)
+17. [Limitations and responsible use](#limitations-and-responsible-use)
 
 ## What it does
 
-- **Citizen:** pick or create a profile and upload an ID card, income certificate and marksheet once. Each field is shown with its confidence, its status (verified or flagged) and the plain reason for any flag.
+A public website (React, served by the API itself) has a landing page, a citizen area, an officer console, and a How it works page. A Streamlit UI remains as a local fallback.
+
+- **Citizen:** pick or create a profile and upload an ID card, income certificate and marksheet once (drag and drop, PNG or JPG up to 3 MB, or one of the synthetic samples). Each field is shown with its confidence, its status (verified or flagged) and the plain reason for any flag.
 - **Apply:** apply for any scheme. The answer comes with a rule-by-rule table. If a scheme rejects you, the app suggests others you may qualify for, and you can apply with the same verified profile and no re-upload.
 - **Officer:** work a queue of cases awaiting review. See conflicts side by side (for example the name on the ID vs on the income certificate) and the image-quality measurements, resolve each flagged fact with a typed reason, then approve, reject or override. Every step lands in an append-only audit trail.
 - **What decides:** rules in YAML files decide eligibility. The model only reads documents.
@@ -34,9 +37,9 @@ Built for Homingo Hackathon Edition 01, Automation track, problem statement B2: 
 
 ```mermaid
 flowchart LR
-    citizen["Citizen pages<br/>(Streamlit)"] -->|HTTP| api
-    officer["Officer pages<br/>(Streamlit)"] -->|HTTP| api
-    subgraph api["FastAPI backend"]
+    site["Website (React + Tailwind)<br/>served at /"] -->|"/api"| api
+    streamlit["Streamlit UI<br/>(local fallback)"] -->|HTTP| api
+    subgraph api["FastAPI: one process serves the site and /api"]
         direction LR
         extract["Extraction<br/>Gemini free tier"] --> verify["Verification<br/>validators, image quality,<br/>cross-document checks"]
         verify --> facts[("Facts")]
@@ -52,7 +55,7 @@ flowchart LR
 
 ## Setup (Windows PowerShell)
 
-Python 3.11 or newer (developed on 3.13). From the `VerifyOnce` folder:
+Python 3.11 or newer (developed on 3.13) and, to build the website, Node.js 20.19 or newer (free; developed on 24). From the `VerifyOnce` folder:
 
 ```powershell
 py -3.13 -m venv .venv
@@ -66,20 +69,45 @@ After `copy`, open `.env` and paste a free key from Google AI Studio on the GEMI
 
 ## Run the app
 
-Two PowerShell windows, both in the `VerifyOnce` folder.
+One command, from the `VerifyOnce` folder. It builds the website if `web\dist` is missing or out of date, then serves the website and the API together on http://127.0.0.1:8000:
+```powershell
+.venv\Scripts\python.exe scripts\serve.py
+```
+Options: `--port 8080`, `--build` (always rebuild), `--no-build`.
 
-Window 1, the API:
+To build the website by hand:
+```powershell
+cd web; npm ci; npm run build; cd ..
+```
+The API answers under `/api/...` (interactive docs at `/docs`). Its original unprefixed paths still answer, for the Streamlit UI and earlier scripts.
+
+**Website development** with live reload, in two windows: start the API (first command below), then `cd web; npm run dev` and open http://localhost:5173 (it forwards `/api` to port 8000).
+
+**Streamlit fallback**, in two windows:
 ```powershell
 .venv\Scripts\python.exe -m uvicorn backend.main:app --port 8000
 ```
-Window 2, the UI (http://localhost:8501):
 ```powershell
 .venv\Scripts\python.exe -m streamlit run frontend\app.py --server.port 8501
 ```
 
-- **Every page** shows a "SYNTHETIC DATA - DEMO ONLY" banner and a status strip: API up or down, provider and model, live or cached extraction.
+- **Every page** shows a permanent "Synthetic data - demo only. Never upload real documents." strip (a "SYNTHETIC DATA - DEMO ONLY" banner in Streamlit). The website's footer shows the system status: API and database, model, live or cache-first extraction, thresholds, public demo on or off.
 - **Display rules:** ID numbers are always masked. Every extracted fact carries a badge saying where it came from: `live` or `cache` and the model, or "seed fixture" for seeded data.
 - **Errors:** failures show a short message, never a stack trace. Details stay in the server windows.
+
+## Public demo safety
+
+Everything is in memory and free: no external service.
+
+- **Uploads:** PNG or JPG only, checked from the file's content, at most 3 MB (413), with a plain message for anything else (422). Bodies over the limit are refused before they are read.
+- **Rate limits per IP address:** 10 uploads and 30 applications per minute (`RATE_LIMIT_UPLOADS_PER_MINUTE`, `RATE_LIMIT_APPLICATIONS_PER_MINUTE`), then 429 with `Retry-After`. Wrong PIN guesses: 5 per minute.
+- **`PUBLIC_DEMO=1`:**
+  - Extraction defaults to the cache (unless `EXTRACTION_USE_CACHE` is set).
+  - Uploads are accepted only for the synthetic samples whose readings are cached, so no model runs for unknown files, unless the visitor enters the demo PIN.
+  - Officer actions (resolve evidence, decide) need the demo PIN in the `X-Demo-Pin` header; viewing the queue and cases does not. With no `DEMO_PIN` set, officer actions are off.
+- **`DEMO_PIN`** comes only from the environment. It never appears in the site's code, in `/status` or in logs, and is compared in constant time. The site keeps it in the browser tab's session storage after the visitor types it.
+- **No stack traces** in any response. **CORS** is off: the site and API share one origin. `CORS_ORIGINS` adds specific origins only if ever needed. Pages carry a Content-Security-Policy (own scripts only) and refuse framing.
+- The Streamlit fallback sends no PIN, so run it with `PUBLIC_DEMO` off (the default).
 
 ## Demo day
 
@@ -175,6 +203,7 @@ Off by default (`EXPLANATIONS_ENABLED=0`), so the demo makes no extra API calls.
 
 | Command | What it does |
 |---|---|
+| `scripts\serve.py` | One command: builds the website if needed, then serves the website and the API on port 8000. |
 | `scripts\demo_reset.py` | Wipes and rebuilds the demo database: five seed profiles, plus two scholarship cases awaiting an officer (`seed-name-mismatch`, `seed-low-confidence`). `--clean` leaves no applications. `seed-below-marks` is kept application-free for the live demo moment. Same result every run. |
 | `scripts\preflight.py` | PASS/FAIL: `.env` exists, key set (never printed), API `/health`, database (and schema version), demo cache complete, live or cached mode. |
 | `scripts\prime_cache.py` | Runs real extraction once per demo document and caches the result. Skips cached files, so it is safe to re-run, and lists failures to retry. |
@@ -187,18 +216,22 @@ Off by default (`EXPLANATIONS_ENABLED=0`), so the demo makes no extra API calls.
 
 ## API
 
+Every path below is served under `/api` (for example `GET /api/status`). The unprefixed paths shown here still answer too, hidden from `/docs`.
+
 | Method | Path | Returns |
 |---|---|---|
 | `GET` | `/health` | Liveness, database check (reports an outdated schema), profile count |
-| `GET` | `/status` | Provider and model, live or cached extraction, whether a key is set (never the key), cutoff, explanations on or off |
+| `GET` | `/status` | Provider and model, live or cached extraction, whether a key is set (never the key), cutoff, explanations on or off, public-demo flags, upload limits (never the PIN) |
+| `GET` | `/demo-documents`, `/demo-documents/{case}/{file}` | The 16 synthetic sample documents, whether each has a cached reading, and the images |
+| `POST` | `/demo-pin` | Checks the `X-Demo-Pin` header (rate-limited) |
 | `GET` | `/profiles`, `/profiles/{id}` | Profiles; documents with image quality, extraction details and facts with checks and flag reasons |
-| `POST` | `/profiles/{id}/documents` | Multipart `document_type` and `file`. Extracts, validates, cross-checks; returns facts, statuses and `extraction_source`. |
+| `POST` | `/profiles/{id}/documents` | Multipart `document_type` and `file` (PNG or JPG, at most 3 MB). Extracts, validates, cross-checks; returns facts, statuses and `extraction_source`. Rate-limited. |
 | `POST` | `/profiles/{id}/applications` | `{"scheme_id": ...}`. New decision with rule outcomes, source facts, reasons and `possible_schemes`. Refused (409) while awaiting or after an officer decision. |
 | `GET` | `/profiles/{id}/applications` | The profile's applications with status and latest decision |
 | `GET` | `/officer/queue` | Applications with status (awaiting officer decision first) and the suggested verdict. `?verdict=` filters. |
 | `GET` | `/officer/cases/{id}` | Case detail: decision on record, suggestion, conflicts side by side, unresolved flags, image quality, approval blockers |
-| `POST` | `/officer/cases/{id}/evidence` | `{fact_id, resolution, reason, officer}`. Returns the new suggestion; records no decision. |
-| `POST` | `/officer/cases/{id}/decision` | `{action, verdict, reason, officer}`, where `action` is approve, reject or override. New officer decision. |
+| `POST` | `/officer/cases/{id}/evidence` | `{fact_id, resolution, reason, officer}`. Returns the new suggestion; records no decision. Needs the demo PIN when `PUBLIC_DEMO=1`. |
+| `POST` | `/officer/cases/{id}/decision` | `{action, verdict, reason, officer}`, where `action` is approve, reject or override. New officer decision. Needs the demo PIN when `PUBLIC_DEMO=1`. |
 | `GET` | `/applications/{id}/audit` | Plain-language audit history with actor and timestamp |
 
 ## Seed cases and documents
@@ -228,7 +261,12 @@ Off by default (`EXPLANATIONS_ENABLED=0`), so the demo makes no extra API calls.
 | `EXTRACTION_PROVIDER` | `gemini` | `anthropic` switches to Anthropic's paid API (`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`) |
 | `VERIFY_ONCE_DB` | `data/verifyonce.db` | SQLite path or SQLAlchemy URL |
 | `VERIFY_ONCE_CONFIDENCE_CUTOFF` | `0.85` | Models report coarse confidences (0.8, 0.9, 1.0); a bare 0.8 does not pass |
-| `API_BASE_URL` | `http://127.0.0.1:8000` | Where the UI finds the API |
+| `PUBLIC_DEMO` | `0` | `1` for a public website: cache by default, sample uploads only without the PIN, officer actions need the PIN |
+| `DEMO_PIN` | (none) | The demo PIN. Set it in the environment only; it is never shown |
+| `CORS_ORIGINS` | (none) | Comma-separated extra origins allowed to call the API. Empty means same origin only |
+| `RATE_LIMIT_UPLOADS_PER_MINUTE` | `10` | Per IP address |
+| `RATE_LIMIT_APPLICATIONS_PER_MINUTE` | `30` | Per IP address |
+| `API_BASE_URL` | `http://127.0.0.1:8000` | Where the Streamlit UI finds the API |
 
 There are no database migrations. After pulling a change to the data model, run `scripts\demo_reset.py`; preflight reports an outdated database.
 
@@ -238,6 +276,13 @@ There are no database migrations. After pulling a change to the data model, run 
 .venv\Scripts\python.exe -m pytest                           # offline: the model is mocked
 .venv\Scripts\python.exe -m pytest -m live --run-live -s     # opt-in: 3 real Gemini calls
 ```
+
+Browser smoke test (opt-in, free). It drives the Edge or Chrome already installed on Windows, so there is no browser download. It loads every page, checks the phone layout, and runs the reject-then-fee-waiver flow:
+```powershell
+.venv\Scripts\python.exe -m pip install -r requirements-e2e.txt
+.venv\Scripts\python.exe -m pytest -m e2e --run-e2e
+```
+Build the website first (`cd web; npm ci; npm run build; cd ..`). `cd web; npm run typecheck` checks the TypeScript.
 
 ## Limitations and responsible use
 
@@ -249,4 +294,4 @@ There are no database migrations. After pulling a change to the data model, run 
 - **Model confidence is not trusted on its own.** In testing, the model gave the same 0.8 to correct and incorrect readings of a blurry scan. Deterministic checks (validators, image quality, cross-document comparison) decide what is flagged.
 - **A free-tier model's availability and limits can change.** Models get overloaded (503), quotas run out (429), and models are retired or closed to new accounts. The app retries, then sends documents to review. Demo documents can be served from a cache of real runs.
 - **Hidden instructions in documents.** The prompt ignores them and the schema refuses extra fields. A model that obeyed an instruction while keeping to the schema would not be caught by the schema alone.
-- **No authentication.** Officer identity is a typed name. This is a demo, not a production system.
+- **No authentication.** Officer identity is a typed name; on a public demo, officer actions need a shared demo PIN. Rate limits are per server process and reset on restart. This is a demo, not a production system.

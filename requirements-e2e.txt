@@ -1,0 +1,4 @@
+# Optional: the browser smoke test (tests/test_site_smoke.py). Free.
+# It drives the Microsoft Edge or Google Chrome already installed, so there is
+# no need to run "playwright install".
+playwright==1.64.1

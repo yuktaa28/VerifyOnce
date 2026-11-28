@@ -20,6 +20,10 @@ DEFAULT_EXTRACTION_PROVIDER = "gemini"
 DEFAULT_GEMINI_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_ANTHROPIC_MODEL = "claude-opus-5-5"
 EXTRACTION_PROVIDERS = ("gemini", "anthropic")
+DEFAULT_WEB_DIST = REPO_ROOT / "web" / "dist"
+DEFAULT_UPLOADS_PER_MINUTE = 10
+DEFAULT_APPLICATIONS_PER_MINUTE = 30
+DEFAULT_PIN_ATTEMPTS_PER_MINUTE = 5
 
 
 def load_env_file(path: Path = REPO_ROOT / ".env") -> None:
@@ -41,6 +45,19 @@ def _flag(raw: str | None) -> bool:
     return (raw or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _origins(raw: str | None) -> tuple[str, ...]:
+    """CORS_ORIGINS: comma-separated origins. Empty (the default) means same origin only."""
+    return tuple(o.strip().rstrip("/") for o in (raw or "").split(",") if o.strip() and o.strip() != "*")
+
+
+def _positive_int(raw: str | None, default: int) -> int:
+    try:
+        value = int((raw or "").strip())
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 @dataclass(frozen=True)
 class Settings:
     database_url: str
@@ -54,6 +71,14 @@ class Settings:
     extraction_use_cache: bool = False
     cache_dir: Path = DEFAULT_CACHE_DIR
     explanations_enabled: bool = False
+    # Public website safety (Step 5). DEMO_PIN is never printed, logged or sent to a client.
+    public_demo: bool = False
+    demo_pin: str | None = field(default=None, repr=False)
+    cors_origins: tuple[str, ...] = ()
+    uploads_per_minute: int = DEFAULT_UPLOADS_PER_MINUTE
+    applications_per_minute: int = DEFAULT_APPLICATIONS_PER_MINUTE
+    pin_attempts_per_minute: int = DEFAULT_PIN_ATTEMPTS_PER_MINUTE
+    web_dist_dir: Path = DEFAULT_WEB_DIST
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.confidence_cutoff <= 1.0:
@@ -79,6 +104,8 @@ class Settings:
     def from_env(cls) -> "Settings":
         load_env_file()
         cutoff = os.environ.get("VERIFY_ONCE_CONFIDENCE_CUTOFF") or DEFAULT_CONFIDENCE_CUTOFF
+        public_demo = _flag(os.environ.get("PUBLIC_DEMO"))
+        use_cache = os.environ.get("EXTRACTION_USE_CACHE", "").strip()
         return cls(
             database_url=database_url(os.environ.get("VERIFY_ONCE_DB")),
             confidence_cutoff=float(cutoff),
@@ -87,6 +114,14 @@ class Settings:
             gemini_model=os.environ.get("GEMINI_MODEL") or DEFAULT_GEMINI_MODEL,
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY") or None,
             anthropic_model=os.environ.get("ANTHROPIC_MODEL") or DEFAULT_ANTHROPIC_MODEL,
-            extraction_use_cache=_flag(os.environ.get("EXTRACTION_USE_CACHE")),
+            # A public demo reads from the cache unless EXTRACTION_USE_CACHE says otherwise.
+            extraction_use_cache=_flag(use_cache) if use_cache else public_demo,
             explanations_enabled=_flag(os.environ.get("EXPLANATIONS_ENABLED")),
+            public_demo=public_demo,
+            demo_pin=(os.environ.get("DEMO_PIN") or "").strip() or None,
+            cors_origins=_origins(os.environ.get("CORS_ORIGINS")),
+            uploads_per_minute=_positive_int(os.environ.get("RATE_LIMIT_UPLOADS_PER_MINUTE"),
+                                             DEFAULT_UPLOADS_PER_MINUTE),
+            applications_per_minute=_positive_int(os.environ.get("RATE_LIMIT_APPLICATIONS_PER_MINUTE"),
+                                                  DEFAULT_APPLICATIONS_PER_MINUTE),
         )

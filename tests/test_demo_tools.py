@@ -64,6 +64,7 @@ def test_reset_script_flags_and_next_steps(settings, capsys):
     out = capsys.readouterr().out
     assert "with applications" in out and "awaiting officer decision" in out
     assert "seed-below-marks: no applications" in out
+    assert "scripts\\serve.py" in out
     assert "uvicorn backend.main:app --port 8000" in out and "streamlit run frontend\\app.py" in out
     assert "scripts\\preflight.py" in out
 

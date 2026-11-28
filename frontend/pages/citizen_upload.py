@@ -5,7 +5,7 @@ import streamlit as st
 from frontend import api, ui
 
 DOCUMENT_TYPES = ["identity_card", "income_certificate", "marksheet"]
-MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp", "gif": "image/gif"}
+MIME = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg"}
 
 ui.page_chrome()
 st.title("📄 Upload documents")
@@ -14,7 +14,7 @@ st.write(f"Uploading to profile **{profile_id}**. Each document is read once and
 
 with st.form("upload", clear_on_submit=False):
     document_type = st.selectbox("Document type", DOCUMENT_TYPES, format_func=ui.document_label)
-    file = st.file_uploader("Document image", type=list(MIME))
+    file = st.file_uploader("Document image (PNG or JPG, up to 3 MB)", type=list(MIME))
     submitted = st.form_submit_button("Upload and read", type="primary")
 
 if submitted:

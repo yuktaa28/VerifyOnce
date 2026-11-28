@@ -1,14 +1,24 @@
-"""FastAPI application factory."""
+"""FastAPI application factory.
+
+One process serves both the API and the website:
+
+* the API under ``/api/...`` (also at the original unprefixed paths, hidden from the
+  schema, so the Streamlit fallback and existing clients keep working);
+* the built website (``web/dist``) at ``/``.
+"""
 
 from __future__ import annotations
 
 import logging
 from collections.abc import Iterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import APIRouter, Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.orm import Session, selectinload
 
@@ -16,11 +26,23 @@ from backend import officer, service
 from backend.api_models import ApplicationRequest, DecisionOut, EvidenceResolutionRequest, OfficerDecisionRequest
 from backend.config import Settings
 from backend.db import init_db, make_engine, make_session_factory, schema_problems
+from backend.demo_assets import demo_documents
 from backend.explanations import Explainer
-from backend.extraction import DOCUMENT_SCHEMAS, MAX_IMAGE_BYTES, Extractor, image_media_type
+from backend.extraction import DOCUMENT_SCHEMAS, Extractor, image_media_type
 from backend.image_quality import MIN_CONTRAST, MIN_SHARPNESS
 from backend.models import Application, AuditEvent, Document, Profile
 from backend.schemes import load_schemes
+from backend.web_safety import (
+    ALLOWED_UPLOAD_TYPES,
+    MAX_REQUEST_BYTES,
+    MAX_UPLOAD_BYTES,
+    MAX_UPLOAD_MB,
+    PIN_HEADER,
+    RateLimiter,
+    UploadRejected,
+    check_upload,
+    pin_matches,
+)
 
 
 class UTF8JSONResponse(JSONResponse):
@@ -36,6 +58,23 @@ def _document_status(facts: list[dict[str, Any]], extraction_ok: bool) -> str:
 
 
 log = logging.getLogger("verifyonce.api")
+
+DOCUMENT_LABELS = {"identity_card": "Identity card", "income_certificate": "Income certificate",
+                   "marksheet": "Marksheet"}
+RATE_LIMIT_MESSAGES = {
+    "upload": "Too many uploads from your network. Wait {wait} seconds and try again.",
+    "apply": "Too many applications from your network. Wait {wait} seconds and try again.",
+    "pin": "Too many wrong PIN attempts. Wait {wait} seconds and try again.",
+}
+# The site loads only its own scripts and styles; nothing from other hosts.
+WEBSITE_CSP = ("default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; "
+               "script-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'self'; "
+               "form-action 'self'; frame-ancestors 'none'")
+
+
+def client_ip(request: Request) -> str:
+    """The caller's address as the server sees it. Forwarded headers are not trusted."""
+    return request.client.host if request.client else "unknown"
 
 
 def create_app(settings: Settings | None = None, *, extractor: Extractor | None = None,
@@ -54,7 +93,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
 
     app = FastAPI(
         title="VerifyOnce",
-        version="0.1.0",
+        version="0.2.0",
         description="Verify a citizen once, then check any scheme against deterministic rules.",
         lifespan=lifespan,
         default_response_class=UTF8JSONResponse,
@@ -65,6 +104,11 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
     app.state.schemes = schemes
     app.state.extractor = extractor
     app.state.explainer = explainer
+    app.state.limits = {
+        "upload": RateLimiter(settings.uploads_per_minute),
+        "apply": RateLimiter(settings.applications_per_minute),
+        "pin": RateLimiter(settings.pin_attempts_per_minute),
+    }
 
     @app.exception_handler(Exception)
     async def unexpected_error(request: Request, exc: Exception) -> UTF8JSONResponse:
@@ -73,11 +117,73 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         return UTF8JSONResponse(status_code=500, content={
             "detail": "Something went wrong on the server. Details are in the API window's log."})
 
+    @app.middleware("http")
+    async def guard(request: Request, call_next):
+        """Refuse oversized bodies before reading them, and add basic security headers."""
+        length = request.headers.get("content-length", "")
+        if request.method == "POST" and length.isdigit() and int(length) > MAX_REQUEST_BYTES:
+            return UTF8JSONResponse(status_code=413, content={
+                "detail": f"The file is larger than {MAX_UPLOAD_MB} MB. "
+                          f"Upload a PNG or JPG image under {MAX_UPLOAD_MB} MB."})
+        response = await call_next(request)
+        response.headers.setdefault("X-Content-Type-Options", "nosniff")
+        response.headers.setdefault("Referrer-Policy", "same-origin")
+        response.headers.setdefault("X-Frame-Options", "DENY")
+        return response
+
+    if settings.cors_origins:
+        # Off by default: the website is served from the API's own origin and needs no CORS.
+        app.add_middleware(CORSMiddleware, allow_origins=list(settings.cors_origins),
+                           allow_methods=["GET", "POST"], allow_headers=["Content-Type", PIN_HEADER])
+
     def get_session(request: Request) -> Iterator[Session]:
         with request.app.state.session_factory() as session:
             yield session
 
-    @app.get("/health")
+    # --- Safety dependencies -------------------------------------------------------------
+
+    def _too_many(bucket: str, wait: int) -> HTTPException:
+        return HTTPException(429, RATE_LIMIT_MESSAGES[bucket].format(wait=wait), headers={"Retry-After": str(wait)})
+
+    def rate_limited(bucket: str):
+        def dependency(request: Request) -> None:
+            wait = request.app.state.limits[bucket].hit(client_ip(request))
+            if wait is not None:
+                raise _too_many(bucket, wait)
+        return Depends(dependency)
+
+    def pin_given_and_correct(request: Request) -> bool | None:
+        """None if no PIN was sent, else whether it matches. Wrong guesses are rate-limited."""
+        given = request.headers.get(PIN_HEADER)
+        if not given:
+            return None
+        limiter: RateLimiter = request.app.state.limits["pin"]
+        ip = client_ip(request)
+        wait = limiter.blocked(ip)
+        if wait is not None:
+            raise _too_many("pin", wait)
+        if pin_matches(settings.demo_pin, given):
+            return True
+        limiter.hit(ip)
+        return False
+
+    def officer_actions_allowed(request: Request) -> None:
+        """On the public demo, officer actions need the demo PIN (and are off if none is set)."""
+        if not settings.public_demo:
+            return
+        if not settings.demo_pin:
+            raise HTTPException(403, "Officer actions are turned off on this public demo.")
+        ok = pin_given_and_correct(request)
+        if ok is None:
+            raise HTTPException(403, "Officer actions on the public demo need the demo PIN.")
+        if not ok:
+            raise HTTPException(403, "That demo PIN is not correct.")
+
+    api = APIRouter()
+
+    # --- Status --------------------------------------------------------------------------
+
+    @api.get("/health")
     def health(session: Session = Depends(get_session)) -> dict[str, Any]:
         """Liveness plus a database check, for preflight checks and the UI."""
         problems = schema_problems(engine)
@@ -87,9 +193,9 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         profiles = len(session.scalars(select(Profile.id)).all())
         return {"status": "ok", "database": "ok", "profiles": profiles, "schemes": list(schemes)}
 
-    @app.get("/status")
+    @api.get("/status")
     def status() -> dict[str, Any]:
-        """What the UI's status strip shows. Says whether a key is set, never the key."""
+        """What the status strip shows. Says whether a key or PIN is set, never the value."""
         ex = app.state.extractor
         return {
             "status": "ok",
@@ -101,23 +207,72 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             "image_quality_thresholds": {"min_sharpness": MIN_SHARPNESS, "min_contrast": MIN_CONTRAST},
             "explanations_enabled": app.state.explainer.enabled,
             "schemes": list(schemes),
+            "public_demo": settings.public_demo,
+            "officer_pin_required": settings.public_demo,
+            "officer_actions_enabled": not settings.public_demo or bool(settings.demo_pin),
+            "own_uploads_need_pin": settings.public_demo,
+            "upload_limits": {"max_bytes": MAX_UPLOAD_BYTES, "max_mb": MAX_UPLOAD_MB,
+                              "types": list(ALLOWED_UPLOAD_TYPES)},
+            "rate_limits": {"uploads_per_minute": settings.uploads_per_minute,
+                            "applications_per_minute": settings.applications_per_minute},
         }
 
-    @app.get("/profiles")
+    @api.post("/demo-pin")
+    def check_demo_pin(request: Request) -> dict[str, Any]:
+        """Check the demo PIN sent in the X-Demo-Pin header. Wrong guesses are rate-limited."""
+        if not settings.demo_pin:
+            raise HTTPException(403, "No demo PIN is set on this server.")
+        ok = pin_given_and_correct(request)
+        if not ok:
+            raise HTTPException(403, "That demo PIN is not correct." if ok is False else "Enter the demo PIN.")
+        return {"ok": True}
+
+    # --- Sample documents ----------------------------------------------------------------
+
+    def _demo_files() -> dict[str, tuple[Path, str]]:
+        return {f"{path.parent.name}/{path.name}": (path, doc_type) for path, doc_type in demo_documents()}
+
+    @api.get("/demo-documents")
+    def list_demo_documents() -> list[dict[str, Any]]:
+        """The synthetic sample documents, and whether a cached reading of each exists."""
+        rows = []
+        for key, (path, doc_type) in _demo_files().items():
+            rows.append({
+                "id": key,
+                "case": path.parent.name,
+                "filename": path.name,
+                "document_type": doc_type,
+                "label": f"{DOCUMENT_LABELS.get(doc_type, doc_type)} · {path.parent.name}",
+                "cached": app.state.extractor.is_cached(path.read_bytes(), doc_type),
+                "url": f"/api/demo-documents/{key}",
+            })
+        return rows
+
+    @api.get("/demo-documents/{case}/{filename}")
+    def demo_document_file(case: str, filename: str) -> FileResponse:
+        found = _demo_files().get(f"{case}/{filename}")
+        if found is None:
+            raise HTTPException(404, "No such sample document")
+        path = found[0]
+        return FileResponse(path, media_type="image/jpeg" if path.suffix.lower() in {".jpg", ".jpeg"} else "image/png")
+
+    # --- Citizen -------------------------------------------------------------------------
+
+    @api.get("/profiles")
     def list_profiles(session: Session = Depends(get_session)) -> list[dict[str, Any]]:
         return officer.list_profiles(session)
 
-    @app.get("/profiles/{profile_id}/applications")
+    @api.get("/profiles/{profile_id}/applications")
     def profile_applications(profile_id: str, session: Session = Depends(get_session)) -> list[dict[str, Any]]:
         if session.get(Profile, profile_id) is None:
             raise HTTPException(404, f"Profile {profile_id!r} not found")
         return officer.profile_applications(session, schemes, profile_id)
 
-    @app.get("/schemes")
+    @api.get("/schemes")
     def list_schemes() -> list[dict[str, Any]]:
         return [scheme.model_dump() for scheme in schemes.values()]
 
-    @app.get("/profiles/{profile_id}")
+    @api.get("/profiles/{profile_id}")
     def get_profile(profile_id: str, session: Session = Depends(get_session)) -> dict[str, Any]:
         profile = session.scalar(
             select(Profile)
@@ -148,24 +303,38 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             ],
         }
 
-    @app.post("/profiles/{profile_id}/documents", status_code=201)
+    @api.post("/profiles/{profile_id}/documents", status_code=201, dependencies=[rate_limited("upload")])
     def upload_document(
+        request: Request,
         profile_id: str,
         document_type: str = Form(...),
         file: UploadFile = File(...),
         session: Session = Depends(get_session),
     ) -> dict[str, Any]:
-        """Upload one document image. Its fields are extracted, validated and cross-checked.
+        """Upload one PNG or JPG document image (max 3 MB). Its fields are extracted, validated and cross-checked.
 
-        Creates the profile if it does not exist yet.
+        Creates the profile if it does not exist yet. On the public demo, only the sample
+        documents (whose readings are cached) are accepted unless the demo PIN is sent.
         """
         if document_type not in DOCUMENT_SCHEMAS:
             raise HTTPException(422, f"document_type must be one of {sorted(DOCUMENT_SCHEMAS)}")
-        content = file.file.read(MAX_IMAGE_BYTES + 1)
+        content = file.file.read(MAX_UPLOAD_BYTES + 1)
+        try:
+            check_upload(content)
+        except UploadRejected as exc:
+            raise HTTPException(exc.status_code, str(exc)) from None
         try:
             image_media_type(content)
         except ValueError as exc:
-            raise HTTPException(422, str(exc)) from None
+            raise HTTPException(422, f"{exc}. Upload a clear PNG or JPG image of the document.") from None
+        if settings.public_demo and not app.state.extractor.is_cached(content, document_type):
+            ok = pin_given_and_correct(request)
+            if ok is False:
+                raise HTTPException(403, "That demo PIN is not correct.")
+            if ok is None:
+                raise HTTPException(403, (
+                    "This public demo accepts the sample documents only, so no model runs for unknown files. "
+                    "Pick a sample document, or enter the demo PIN to upload your own synthetic image."))
 
         document, result, changes = service.ingest_document(
             session, app.state.extractor, profile_id, document_type, content,
@@ -195,7 +364,8 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             "other_facts_changed": [c for c in changes if c["fact_id"] not in own_fact_ids],
         }
 
-    @app.post("/profiles/{profile_id}/applications", status_code=201, response_model=DecisionOut)
+    @api.post("/profiles/{profile_id}/applications", status_code=201, response_model=DecisionOut,
+              dependencies=[rate_limited("apply")])
     def submit_application(
         profile_id: str, body: ApplicationRequest, session: Session = Depends(get_session)
     ) -> dict[str, Any]:
@@ -220,7 +390,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             audit_event_id=audit.id, possible=possible,
         )
 
-    @app.get("/applications/{application_id}")
+    @api.get("/applications/{application_id}")
     def get_application(application_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
         application = session.get(Application, application_id)
         if application is None:
@@ -258,7 +428,7 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
             ],
         }
 
-    @app.get("/applications/{application_id}/audit")
+    @api.get("/applications/{application_id}/audit")
     def application_audit(application_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
         try:
             return officer.application_audit(session, application_id)
@@ -282,18 +452,19 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         return service.decision_payload(decision, profile_id=application.profile_id,
                                         scheme=schemes[application.scheme_id], audit_event_id=audit.id, possible=[])
 
-    @app.get("/officer/queue")
+    @api.get("/officer/queue")
     def officer_queue(verdict: list[str] | None = Query(default=None),
                       session: Session = Depends(get_session)) -> list[dict[str, Any]]:
         """Applications with their latest decision, awaiting-officer cases first. Filter with ?verdict=..."""
         return officer.officer_queue(session, schemes, verdict, cutoff=settings.confidence_cutoff)
 
-    @app.get("/officer/cases/{application_id}")
+    @api.get("/officer/cases/{application_id}")
     def case_detail(application_id: int, session: Session = Depends(get_session)) -> dict[str, Any]:
         return _officer_errors(lambda: officer.case_detail(
             session, schemes, application_id, cutoff=settings.confidence_cutoff))
 
-    @app.post("/officer/cases/{application_id}/evidence", status_code=201)
+    @api.post("/officer/cases/{application_id}/evidence", status_code=201,
+              dependencies=[Depends(officer_actions_allowed)])
     def resolve_evidence(application_id: int, body: EvidenceResolutionRequest,
                          session: Session = Depends(get_session)) -> dict[str, Any]:
         """Confirm or reject one fact (typed reason required).
@@ -308,7 +479,8 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         session.commit()
         return result
 
-    @app.post("/officer/cases/{application_id}/decision", status_code=201, response_model=DecisionOut)
+    @api.post("/officer/cases/{application_id}/decision", status_code=201, response_model=DecisionOut,
+              dependencies=[Depends(officer_actions_allowed)])
     def officer_decision(application_id: int, body: OfficerDecisionRequest,
                          session: Session = Depends(get_session)) -> dict[str, Any]:
         """approve / reject / override. Approval is refused (409) while flagged evidence is unresolved."""
@@ -319,4 +491,34 @@ def create_app(settings: Settings | None = None, *, extractor: Extractor | None 
         session.commit()
         return _decision_response(session, decision, audit)
 
+    app.include_router(api, prefix="/api")
+    # The original paths, used by the Streamlit fallback and earlier scripts. Same handlers,
+    # same limits and PIN checks.
+    app.include_router(api, include_in_schema=False)
+
+    _mount_website(app, settings.web_dist_dir)
     return app
+
+
+def _mount_website(app: FastAPI, dist: Path) -> None:
+    """Serve the built single-page site from ``dist``; unknown paths get index.html."""
+    dist = Path(dist)
+    if (dist / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=dist / "assets"), name="assets")
+    root = dist.resolve()
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/{path:path}", include_in_schema=False)
+    def website(path: str = ""):
+        if path == "api" or path.startswith("api/"):
+            raise HTTPException(404, "Not found")
+        if path:
+            candidate = (dist / path).resolve()
+            if candidate.is_file() and root in candidate.parents:
+                return FileResponse(candidate)
+        index = dist / "index.html"
+        if not index.is_file():
+            return UTF8JSONResponse(status_code=404, content={
+                "detail": "The website is not built yet. Run: cd web; npm install; npm run build"})
+        return FileResponse(index, media_type="text/html; charset=utf-8",
+                            headers={"Cache-Control": "no-cache", "Content-Security-Policy": WEBSITE_CSP})

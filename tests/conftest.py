@@ -28,15 +28,17 @@ DOCUMENTS = REPO_ROOT / "data" / "documents"
 
 def pytest_addoption(parser):
     parser.addoption("--run-live", action="store_true", help="run tests that call the real Anthropic API")
+    parser.addoption("--run-e2e", action="store_true", help="run the browser smoke test (Playwright + installed Edge)")
 
 
 def pytest_collection_modifyitems(config, items):
-    if config.getoption("--run-live"):
-        return
-    skip = pytest.mark.skip(reason="calls the real Anthropic API; run with: python -m pytest -m live --run-live")
+    skip_live = pytest.mark.skip(reason="calls the real Anthropic API; run with: python -m pytest -m live --run-live")
+    skip_e2e = pytest.mark.skip(reason="browser smoke test; run with: python -m pytest -m e2e --run-e2e")
     for item in items:
-        if "live" in item.keywords:
-            item.add_marker(skip)
+        if "live" in item.keywords and not config.getoption("--run-live"):
+            item.add_marker(skip_live)
+        if "e2e" in item.keywords and not config.getoption("--run-e2e"):
+            item.add_marker(skip_e2e)
 
 
 @pytest.fixture(autouse=True)
